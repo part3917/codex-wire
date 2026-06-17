@@ -1,0 +1,15 @@
+.env
+*.log
+__pycache__/
+*.pyc
+.DS_Store
+codex_wire_jobs.json
+auth.json
+codex_[0-9]*.md
+codex_[0-9]*.md.log
+codex-wire/
+codex-wire-out/
+out/
+output/
+outputs/
+tmp/

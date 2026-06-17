@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ -n "${CODEX_INSTRUCTIONS_FILE:-}" ]; then
+  exec codex -c "model_instructions_file=\"$CODEX_INSTRUCTIONS_FILE\"" "$@"
+fi
+
+exec codex "$@"

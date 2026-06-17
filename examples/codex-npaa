@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Example of pointing codex at your own instructions file.
+INSTRUCTIONS_FILE="/path/to/your/AGENTS.md"
+
+exec codex \
+  -c "model_instructions_file=\"$INSTRUCTIONS_FILE\"" \
+  "$@"
