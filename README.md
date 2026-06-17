@@ -1,5 +1,7 @@
 # codex-wire
 
+English · [한국어](README.ko.md)
+
 Live telemetry + dispatch wrapper for the OpenAI Codex CLI, driven by Claude Code. by 3917
 
 ## What It Does
