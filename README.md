@@ -84,7 +84,7 @@ The logbook at the bottom of the same view (shown above): recently finished, non
 ## Install
 
 ```bash
-git clone <your-private-repo-url> codex-wire
+git clone https://github.com/part3917/codex-wire.git codex-wire
 cd codex-wire
 ./install.sh
 ```
