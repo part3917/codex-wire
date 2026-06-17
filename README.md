@@ -135,6 +135,8 @@ If `CODEX_INSTRUCTIONS_FILE` is unset or empty, `codex-instructions` runs `codex
 
 `dispatch.sh` is meant to be called from Claude Code in the background to delegate coding work to Codex while Claude Code continues monitoring or coordinating other tasks.
 
+A ready-made **`/codex` skill** — an orchestration doctrine (Claude plans, Codex codes, and you **check in mid-run** via this dashboard) — is in [`examples/codex.md`](examples/codex.md). Copy it to `~/.claude/commands/codex.md` to use it as a `/codex` slash command. Its core idea: dispatching and waiting is delegation; watching a job and steering it mid-flight is orchestration.
+
 ## Configuration
 
 Copy `.env.example` to `.env` and edit values as needed. The main knobs are:
