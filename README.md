@@ -4,6 +4,8 @@ English · [한국어](README.ko.md)
 
 Live telemetry + dispatch wrapper for the OpenAI Codex CLI, driven by Claude Code. by 3917
 
+![codex-wire dashboard](assets/00-dashboard.png)
+
 ## What It Does
 
 - `dispatch.sh` runs one `codex exec` job, detects completion through its unique `--output-last-message` file, then reaps the lingering process that can remain after Codex has finished.

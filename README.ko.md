@@ -4,6 +4,8 @@
 
 OpenAI Codex CLI를 위한 실시간 텔레메트리 + 디스패치 래퍼로, Claude Code로 구동됩니다. by 3917
 
+![codex-wire 대시보드](assets/00-dashboard.png)
+
 ## 무엇을 하나요
 
 - `dispatch.sh`는 하나의 `codex exec` 작업을 실행하고, 고유한 `--output-last-message` 파일을 통해 완료를 감지한 뒤, Codex가 끝난 후에도 남아 있을 수 있는 잔여 프로세스를 정리합니다.
