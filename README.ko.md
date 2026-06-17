@@ -135,6 +135,8 @@ CODEX_INSTRUCTIONS_FILE=/path/to/your/AGENTS.md ./codex-instructions exec -C "$P
 
 `dispatch.sh`는 Claude Code가 다른 작업을 계속 모니터링하거나 조율하는 동안, 코딩 작업을 Codex에 위임하기 위해 백그라운드에서 호출되도록 의도되었습니다.
 
+바로 쓸 수 있는 **`/codex` 스킬** — 오케스트레이션 doctrine(Claude가 기획, Codex가 코딩, 그리고 이 대시보드로 **중간 점검**) — 이 [`examples/codex.md`](examples/codex.md)에 있습니다. `~/.claude/commands/codex.md`로 복사하면 `/codex` 슬래시 커맨드로 쓸 수 있습니다. 핵심: 던지고 기다리는 건 위임이고, 도는 작업을 지켜보며 중간에 조정하는 게 오케스트레이션입니다.
+
 ## 설정
 
 `.env.example`을 `.env`로 복사한 뒤 필요에 따라 값을 편집하세요. 주요 노브는 다음과 같습니다:

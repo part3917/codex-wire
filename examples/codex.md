@@ -73,9 +73,9 @@ curl -s -o /dev/null http://localhost:8787 || nohup python3 codex_monitor.py >/d
 
 Then open http://localhost:8787. It distinguishes parallel jobs by their output key, so many Codex runs show on one screen. The wrapper reaps, so `RUNNING` returns to 0 when work is done.
 
-## ★ Mid-run check-in (the spine) — don't find out only at the end
+## ★ Mid-run check-in (the spine) — Claude watches Codex while it runs
 
-A completion notice tells you it *finished*, not whether it *did the right thing*. For long jobs (~15 min+) or risky changes, look in once or twice while it runs and catch drift immediately. Waiting until the end to discover drift wastes the entire run.
+This is the orchestrator's job, and it is what makes `/codex` more than fire-and-forget: **you (Claude) look in on long / risky Codex jobs while they run** and catch drift mid-flight — the human never has to babysit, and a wrong run gets killed early instead of discovered at the end. A completion notice only tells you a job *finished*, not whether it *did the right thing*.
 
 ⚠️ **The `--output-last-message` file holds only the final message → it is empty mid-run.** Don't `cat` it for progress. Check progress elsewhere:
 
