@@ -5,7 +5,7 @@ Sources (stdlib only, no deps):
   • `ps`                          → running codex exec jobs (pid, elapsed, cwd, sandbox)
   • ~/.codex/sessions/**/*.jsonl  → live activity: commands, file edits, agent messages, tokens
 """
-import argparse, ctypes, datetime, glob, json, os, re, shlex, signal, struct, subprocess, sys, time, urllib.parse
+import argparse, ctypes, datetime, glob, hashlib, json, os, re, shlex, signal, struct, subprocess, sys, threading, time, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8787
@@ -20,10 +20,11 @@ LONG_OP_GRACE_SEC = int(os.environ.get("CODEX_MONITOR_LONG_OP_GRACE_SEC", "180")
 TRACK_PATH = os.path.expanduser(os.environ.get("CODEX_MONITOR_TRACK_PATH", "~/.codex/codex_wire_jobs.json"))
 TRACK_TTL_SEC = int(os.environ.get("CODEX_MONITOR_TRACK_TTL_SEC", str(7 * 24 * 3600)))
 
-# Approximate gpt-5.5 placeholder pricing per 1M tokens; adjust if pricing changes.
-COST_INPUT_PER_MTOK = float(os.environ.get("CODEX_MONITOR_COST_INPUT", "1.25"))
-COST_CACHED_PER_MTOK = float(os.environ.get("CODEX_MONITOR_COST_CACHED", "0.125"))
-COST_OUTPUT_PER_MTOK = float(os.environ.get("CODEX_MONITOR_COST_OUTPUT", "10.0"))
+# Pricing is USD per 1M tokens.
+DEFAULT_MODEL = "gpt-5.5"
+PRICING = {
+    "gpt-5.5": {"input": 5.0, "cached": 0.5, "output": 30.0},
+}
 
 _TRACK_STATE = None
 
@@ -346,29 +347,77 @@ def _error_entry(ts, cmd, exit_code, output):
     return err
 
 
-def _usage_cost(tokens):
+def _pricing_for_model(model):
+    model = str(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    key = model.lower()
+    if key in PRICING:
+        return key, PRICING[key], False
+    return DEFAULT_MODEL, PRICING[DEFAULT_MODEL], True
+
+
+def _usage_cost(tokens, pricing):
     uncached = max(0, tokens.get("input", 0) - tokens.get("cached", 0))
-    cost = (uncached * COST_INPUT_PER_MTOK +
-            tokens.get("cached", 0) * COST_CACHED_PER_MTOK +
-            tokens.get("output", 0) * COST_OUTPUT_PER_MTOK) / 1_000_000
+    cost = (uncached * pricing["input"] +
+            tokens.get("cached", 0) * pricing["cached"] +
+            tokens.get("output", 0) * pricing["output"]) / 1_000_000
     return round(cost, 4)
 
 
-def _normalize_usage(info):
+def _normalize_usage(info, model=None):
     usage = ((info or {}).get("total_token_usage") or
              (info or {}).get("last_token_usage") or
              (info or {}).get("usage") or {})
+    model = ((info or {}).get("model") or (info or {}).get("model_name") or model or DEFAULT_MODEL)
+    pricing_model, pricing, fallback = _pricing_for_model(model)
     tokens = {
         "input": int(usage.get("input_tokens") or 0),
         "cached": int(usage.get("cached_input_tokens") or 0),
         "output": int(usage.get("output_tokens") or 0),
         "reasoning": int(usage.get("reasoning_output_tokens") or 0),
         "total": int(usage.get("total_tokens") or 0),
+        "model": str(model or DEFAULT_MODEL),
+        "cost_model": pricing_model,
+        "cost_estimate": fallback,
+        "cost_note": "est:fallback" if fallback else "",
     }
     if not tokens["total"]:
         tokens["total"] = tokens["input"] + tokens["output"]
-    tokens["cost"] = _usage_cost(tokens)
+    tokens["cost"] = _usage_cost(tokens, pricing)
     return tokens
+
+
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _rate_sample(rl, ts, ets):
+    pct = _num((rl or {}).get("used_percent"))
+    if pct is None:
+        return None
+    return {
+        "pct": pct,
+        "window": (rl or {}).get("window_minutes"),
+        "resets_at": (rl or {}).get("resets_at"),
+        "ts": ets if ets is not None else _epoch(ts),
+    }
+
+
+def _latest_active_rate(sessions, key, now):
+    latest = None
+    for s in sessions:
+        sample = (s or {}).get(key) or {}
+        pct = _num(sample.get("pct"))
+        resets_at = _num(sample.get("resets_at"))
+        if pct is None or resets_at is None or resets_at <= now:
+            continue
+        ts = _num(sample.get("ts"))
+        rank = ts if ts is not None else resets_at
+        if latest is None or (rank, resets_at) > (latest[0], latest[1]):
+            latest = (rank, resets_at, pct)
+    return latest[2] if latest else None
 
 
 def parse_session(path):
@@ -379,6 +428,7 @@ def parse_session(path):
         return None
     s = {"file": path, "cwd": "", "prompt": "", "n_cmds": 0, "n_edits": 0,
          "files": [], "last_cmd": "", "last_msg": "", "rate_pct": None,
+         "rate_primary": None, "rate_secondary": None,
          "ctx_window": None, "started": None, "last_ts": st.st_mtime,
          "last_event_ts": "", "last_event_epoch": None, "pending_cmd": "",
          "pending_cmds": [], "pending_long": False,
@@ -396,7 +446,7 @@ def parse_session(path):
         p = o.get("payload", {}) or {}
         otype, ptype = o.get("type"), p.get("type", "")
         if otype == "session_meta" or ("cwd" in p and not s["cwd"]):
-            s["cwd"] = p.get("cwd", s["cwd"]); s["model"] = p.get("model", s["model"]) or s["model"]
+            s["cwd"] = p.get("cwd", s["cwd"]); s["model"] = (p.get("model") or o.get("model") or s["model"])
         elif ptype == "task_started":
             s["started"] = p.get("started_at"); s["ctx_window"] = p.get("model_context_window")
         elif ptype == "user_message":
@@ -445,12 +495,18 @@ def parse_session(path):
                 s["errors"].append(err)
                 _event(s["events"], ts, "err", f"{err['label']}: apply_patch", True)
         elif ptype == "token_count":
-            rl = (p.get("rate_limits") or {}).get("primary") or {}
-            if rl.get("used_percent") is not None:
-                s["rate_pct"] = rl["used_percent"]
+            rate_limits = p.get("rate_limits") or {}
+            primary = _rate_sample(rate_limits.get("primary") or {}, ts, ets)
+            if primary is not None:
+                s["rate_primary"] = primary
+                s["rate_pct"] = primary["pct"]
+            secondary = _rate_sample(rate_limits.get("secondary") or {}, ts, ets)
+            if secondary is not None:
+                s["rate_secondary"] = secondary
             info = p.get("info") or {}
             if info:
-                s["tokens"] = _normalize_usage(info)
+                s["model"] = (p.get("model") or info.get("model") or info.get("model_name") or s.get("model") or DEFAULT_MODEL)
+                s["tokens"] = _normalize_usage(info, s["model"])
                 if info.get("model_context_window"):
                     s["ctx_window"] = info.get("model_context_window")
     if parse_errors:
@@ -460,7 +516,7 @@ def parse_session(path):
     pending = [v for v in exec_calls.values() if isinstance(v, dict) and v.get("cmd")]
     s["pending_cmds"] = [v["cmd"] for v in pending][-3:]
     s["pending_cmd"] = s["pending_cmds"][-1] if s["pending_cmds"] else ""
-    s["pending_long"] = bool(_LONG_CMD_RE.search(s["pending_cmd"] or s["last_cmd"] or ""))
+    s["pending_long"] = bool(s["pending_cmd"] and _LONG_CMD_RE.search(s["pending_cmd"]))
     s["files"] = sorted(files)[:12]
     s["events"] = s["events"][-12:]
     s["outputs"] = s["outputs"][-5:]
@@ -468,12 +524,14 @@ def parse_session(path):
     return s
 
 
-def all_sessions(limit=SESSION_LIMIT):
+def _mtime(path):
     try:
-        files = glob.glob(os.path.join(SESS, "**", "*.jsonl"), recursive=True)
-    except Exception:
-        files = []
-    files = sorted(files, key=lambda f: os.path.getmtime(f), reverse=True)[:limit]
+        return os.path.getmtime(path)
+    except OSError:
+        return 0
+
+
+def _parse_session_files(files):
     out = []
     for f in files:
         try:
@@ -488,6 +546,16 @@ def all_sessions(limit=SESSION_LIMIT):
             continue
         _PARSE_CACHE[f] = (st.st_mtime, st.st_size, s)
         out.append(s)
+    return out
+
+
+def all_sessions(limit=SESSION_LIMIT):
+    try:
+        files = glob.glob(os.path.join(SESS, "**", "*.jsonl"), recursive=True)
+    except Exception:
+        files = []
+    files = sorted(files, key=_mtime, reverse=True)[:limit]
+    out = _parse_session_files(files)
     if len(_PARSE_CACHE) > 320:                    # evict entries no longer in window
         keep = set(files)
         for k in [k for k in _PARSE_CACHE if k not in keep]:
@@ -529,8 +597,7 @@ def _last_event_age(s, now):
 def _activity_meta(s, pid_alive, now):
     age_sec = _last_event_age(s, now)
     pending_cmd = (s or {}).get("pending_cmd", "") if s else ""
-    last_cmd = (s or {}).get("last_cmd", "") if s else ""
-    long_op = bool(s and (s.get("pending_long") or _LONG_CMD_RE.search(pending_cmd or last_cmd or "")))
+    long_op = bool(s and pending_cmd and (s.get("pending_long") or _LONG_CMD_RE.search(pending_cmd)))
     has_progress_signal = bool(long_op or pending_cmd)
     meta = {
         "status": "running", "confidence": 0, "label": "live",
@@ -551,7 +618,7 @@ def _activity_meta(s, pid_alive, now):
         meta.update(confidence=5, label="live", reason="last event is fresh")
         return meta
     if long_op and age_sec <= LONG_OP_GRACE_SEC:
-        meta.update(confidence=35, label="quiet long cmd", reason="PID is alive and the last/pending command looks long-running")
+        meta.update(confidence=35, label="quiet long cmd", reason="PID is alive and the pending command looks long-running")
         return meta
     if long_op and age_sec <= LONG_OP_GRACE_SEC * 2:
         meta.update(confidence=55, label="long cmd watch", reason="long-running command is quiet beyond the first grace window")
@@ -739,7 +806,372 @@ def _job_payload(j, s, now):
         "events": (s or {}).get("events", []), "outputs": (s or {}).get("outputs", []),
         "errors": (s or {}).get("errors", []), "tokens": tokens,
         "token_total": tokens.get("total", 0), "cost": tokens.get("cost", 0.0),
+        "cost_estimate": tokens.get("cost_estimate", False), "cost_note": tokens.get("cost_note", ""),
     }
+
+
+# ── Cost history ─────────────────────────────────────────────────────────────
+# Cost graph points are derived from token_count cumulative deltas. This parser
+# intentionally does not use _iter(): large files must not skip middle deltas.
+_COST_INDEX_PATH = os.path.expanduser("~/.codex/codex_wire_cost_index.json")
+_COST_INDEX_SCHEMA = 1
+_COST_INDEX = None
+_COST_INDEX_LOCK = threading.Lock()
+_COST_INDEX_STATS = {"reused": 0, "parsed": 0, "rescanned": 0, "saved": False, "generation": 0}
+_SERIES_CACHE = {"ts": 0.0, "data": None, "sig": None, "generation": None, "pricing_version": None}
+_COST_RANGES = [                     # name, span seconds, bucket count
+    ("5h",    5 * 3600,        30),
+    ("day",   24 * 3600,       24),
+    ("week",  7 * 24 * 3600,   7),
+    ("month", 30 * 24 * 3600,  30),
+]
+_COST_LABEL = {"5h": "5h session", "day": "last 24h", "week": "last 7 days",
+               "month": "last 30 days", "year": "last 12 months"}
+
+
+def _pricing_version():
+    payload = {"default_model": DEFAULT_MODEL, "pricing": PRICING}
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _empty_cost_index():
+    return {
+        "version": _COST_INDEX_SCHEMA,
+        "pricing_version": _pricing_version(),
+        "generation": 0,
+        "updated_at": 0,
+        "files": {},
+    }
+
+
+def _load_cost_index():
+    global _COST_INDEX
+    if _COST_INDEX is not None:
+        return _COST_INDEX
+    try:
+        with open(_COST_INDEX_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if (data.get("version") != _COST_INDEX_SCHEMA or
+            data.get("pricing_version") != _pricing_version() or
+            not isinstance(data.get("files"), dict)):
+        data = _empty_cost_index()
+    data.setdefault("generation", 0)
+    data.setdefault("files", {})
+    data["pricing_version"] = _pricing_version()
+    _COST_INDEX = data
+    return _COST_INDEX
+
+
+def _save_cost_index(index):
+    try:
+        os.makedirs(os.path.dirname(_COST_INDEX_PATH), exist_ok=True)
+        tmp = _COST_INDEX_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(index, fh, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        os.replace(tmp, _COST_INDEX_PATH)
+        return True
+    except Exception:
+        return False
+
+
+def _file_sig(path, st):
+    return (path, int(st.st_dev), int(st.st_ino), int(st.st_size), float(st.st_mtime))
+
+
+def _cost_usage_from_info(info):
+    usage = (info or {}).get("total_token_usage") or (info or {}).get("usage") or {}
+    if not isinstance(usage, dict) or not usage:
+        return None
+
+    def iv(name):
+        try:
+            return max(0, int(usage.get(name) or 0))
+        except Exception:
+            return 0
+
+    out = {
+        "input": iv("input_tokens"),
+        "cached": iv("cached_input_tokens"),
+        "output": iv("output_tokens"),
+        "total": iv("total_tokens"),
+    }
+    if not out["total"]:
+        out["total"] = out["input"] + out["output"]
+    return out
+
+
+def _usage_decreased(cur, prev):
+    if not prev:
+        return False
+    return any(int(cur.get(k, 0)) < int(prev.get(k, 0)) for k in ("input", "cached", "output", "total"))
+
+
+def _usage_delta(cur, prev):
+    prev = prev or {}
+    return {k: max(0, int(cur.get(k, 0)) - int(prev.get(k, 0))) for k in ("input", "cached", "output", "total")}
+
+
+def _cost_file_record(path, st, old=None, reset=False):
+    old = old if isinstance(old, dict) else {}
+    points = [] if reset else list(old.get("points") or [])
+    last_usage = None if reset else old.get("last_usage")
+    last_model = "" if reset else str(old.get("last_model") or "")
+    last_ts = "" if reset else str(old.get("last_ts") or "")
+    offset = 0 if reset else int(old.get("offset") or 0)
+    if offset < 0 or offset > st.st_size:
+        offset = 0
+        points, last_usage, last_model, last_ts = [], None, "", ""
+
+    parse_errors, severe, parsed_any = [], False, False
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            while True:
+                pos = fh.tell()
+                raw = fh.readline()
+                if not raw:
+                    break
+                next_pos = fh.tell()
+                stripped = raw.strip()
+                if not stripped:
+                    offset = next_pos
+                    continue
+                try:
+                    obj = json.loads(stripped)
+                except Exception as e:
+                    if not raw.endswith(b"\n"):
+                        offset = pos
+                        break
+                    parse_errors.append(str(e))
+                    offset = next_pos
+                    if len(parse_errors) >= 3:
+                        severe = True
+                        break
+                    continue
+
+                parsed_any = True
+                offset = next_pos
+                payload = obj.get("payload", {}) or {}
+                model = payload.get("model") or obj.get("model") or last_model
+                if model:
+                    last_model = str(model)
+                if payload.get("type") != "token_count":
+                    continue
+                info = payload.get("info") or {}
+                usage = _cost_usage_from_info(info)
+                if not usage:
+                    continue
+                model = payload.get("model") or info.get("model") or info.get("model_name") or last_model or DEFAULT_MODEL
+                last_model = str(model)
+                ep = _epoch(obj.get("timestamp", ""))
+                if ep is None:
+                    last_usage = usage
+                    continue
+                if _usage_decreased(usage, last_usage):
+                    last_usage = usage
+                    last_ts = obj.get("timestamp", "") or last_ts
+                    continue
+                delta = _usage_delta(usage, last_usage)
+                last_usage = usage
+                last_ts = obj.get("timestamp", "") or last_ts
+                if not any(delta.get(k, 0) for k in ("input", "cached", "output", "total")):
+                    continue
+                _, pricing, _ = _pricing_for_model(model)
+                cost = _usage_cost(delta, pricing)
+                if cost or delta.get("total", 0):
+                    points.append({"ts": ep, "cost": cost, "total": int(delta.get("total", 0))})
+    except Exception:
+        if not reset:
+            return _cost_file_record(path, st, None, True), True, True, False
+
+    if severe and not reset:
+        rec, _, _, _ = _cost_file_record(path, st, None, True)
+        return rec, True, True, True
+
+    rec = {
+        "dev": int(st.st_dev),
+        "ino": int(st.st_ino),
+        "size": int(st.st_size),
+        "mtime": float(st.st_mtime),
+        "offset": int(offset),
+        "last_usage": last_usage or {"input": 0, "cached": 0, "output": 0, "total": 0},
+        "last_model": last_model or DEFAULT_MODEL,
+        "last_ts": last_ts,
+        "points": points,
+    }
+    if parse_errors:
+        rec["parse_errors"] = parse_errors[:3]
+    meta_changed = (
+        int(old.get("dev", -1)) != int(st.st_dev) or
+        int(old.get("ino", -1)) != int(st.st_ino) or
+        int(old.get("size", -1)) != int(st.st_size) or
+        float(old.get("mtime") or 0) != float(st.st_mtime)
+    )
+    changed = bool(parsed_any or offset != int(old.get("offset") or 0) or reset or meta_changed)
+    return rec, changed, bool(reset), bool(severe)
+
+
+def _refresh_cost_index(entries):
+    global _COST_INDEX_STATS
+    with _COST_INDEX_LOCK:
+        index = _load_cost_index()
+        files = index.setdefault("files", {})
+        seen = {path for path, _ in entries}
+        dirty = False
+        stats = {"reused": 0, "parsed": 0, "rescanned": 0, "saved": False, "generation": index.get("generation", 0)}
+
+        for path in list(files):
+            if path not in seen:
+                files.pop(path, None)
+                dirty = True
+
+        for path, st in entries:
+            old = files.get(path)
+            reset = False
+            if isinstance(old, dict):
+                same_identity = int(old.get("dev", -1)) == int(st.st_dev) and int(old.get("ino", -1)) == int(st.st_ino)
+                old_size = int(old.get("size") or 0)
+                old_offset = int(old.get("offset") or 0)
+                complete = old_offset >= int(st.st_size)
+                if same_identity and old_size == int(st.st_size) and float(old.get("mtime") or 0) == float(st.st_mtime) and complete:
+                    stats["reused"] += 1
+                    continue
+                if not same_identity or int(st.st_size) < old_size or int(st.st_size) < old_offset:
+                    reset = True
+            else:
+                reset = True
+
+            rec, changed, rescanned, _ = _cost_file_record(path, st, old, reset)
+            files[path] = rec
+            if changed:
+                dirty = True
+                stats["parsed"] += 1
+            else:
+                stats["reused"] += 1
+            if rescanned:
+                stats["rescanned"] += 1
+
+        if dirty:
+            index["generation"] = int(index.get("generation") or 0) + 1
+            index["updated_at"] = time.time()
+            stats["generation"] = index["generation"]
+            stats["saved"] = _save_cost_index(index)
+        _COST_INDEX_STATS = stats
+        pts = []
+        for rec in files.values():
+            for pt in rec.get("points") or []:
+                if pt and (pt.get("cost") or pt.get("total")):
+                    pts.append(pt)
+        return pts, int(index.get("generation") or 0), stats
+
+
+def _year_buckets(pts, now):
+    base = datetime.datetime.fromtimestamp(now)
+    months, y, m = [], base.year, base.month
+    for _ in range(12):
+        months.append((y, m))
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    months.reverse()
+    index = {ym: i for i, ym in enumerate(months)}
+    cost, toks = [0.0] * 12, 0
+    for pt in pts:
+        d = datetime.datetime.fromtimestamp(pt["ts"])
+        i = index.get((d.year, d.month))
+        if i is not None:
+            cost[i] += pt["cost"]
+            toks += pt["total"]
+    return cost, toks
+
+
+def _cost_axis(name, now):
+    """Time anchors for a range's x-axis: normalized x (0=oldest, 1=now) + label."""
+    base = datetime.datetime.fromtimestamp(now)
+    td = datetime.timedelta
+    if name == "5h":
+        return [{"x": round(1 - h / 5, 4), "label": "now" if h == 0 else f"-{h}h"} for h in (5, 4, 3, 2, 1, 0)]
+    if name == "day":
+        out = []
+        for h in range(24, -1, -2):
+            t = base - td(hours=h)
+            out.append({"x": round(1 - h / 24, 4), "label": "now" if h == 0 else t.strftime("%H:%M")})
+        return out
+    if name == "week":
+        return [{"x": round((i + 0.5) / 7, 4), "label": (base - td(days=6 - i)).strftime("%a")} for i in range(7)]
+    if name == "month":
+        out = []
+        for d in (30, 20, 10, 0):
+            t = base - td(days=d)
+            out.append({"x": round(1 - d / 30, 4), "label": "now" if d == 0 else f"{t.month}/{t.day}"})
+        return out
+    if name == "year":
+        seq, y, m = [], base.year, base.month
+        for _ in range(12):
+            seq.append((y, m)); m -= 1
+            if m == 0:
+                m, y = 12, y - 1
+        seq.reverse()
+        return [{"x": round((i + 0.5) / 12, 4), "label": datetime.date(yy, mm, 1).strftime("%b")}
+                for i, (yy, mm) in enumerate(seq)]
+    return []
+
+
+def cost_series(now):
+    """Bucket token_count delta spend into rolling windows."""
+    try:
+        files = sorted(glob.glob(os.path.join(SESS, "**", "*.jsonl"), recursive=True))
+    except Exception:
+        files = []
+    entries, sig = [], []
+    for f in files:
+        try:
+            st = os.stat(f)
+        except OSError:
+            continue
+        entries.append((f, st))
+        sig.append(_file_sig(f, st))
+
+    pricing_version = _pricing_version()
+    if (_SERIES_CACHE["data"] is not None and (now - _SERIES_CACHE["ts"]) < 15 and
+            _SERIES_CACHE.get("sig") == sig and
+            _SERIES_CACHE.get("pricing_version") == pricing_version):
+        return _SERIES_CACHE["data"]
+
+    pts, generation, _ = _refresh_cost_index(entries)
+    if (_SERIES_CACHE["data"] is not None and (now - _SERIES_CACHE["ts"]) < 15 and
+            _SERIES_CACHE.get("sig") == sig and
+            _SERIES_CACHE.get("generation") == generation and
+            _SERIES_CACHE.get("pricing_version") == pricing_version):
+        return _SERIES_CACHE["data"]
+
+    out = {}
+    for name, span, nb in _COST_RANGES:
+        start, width = now - span, span / nb
+        cost, toks = [0.0] * nb, 0
+        for pt in pts:
+            if pt["ts"] < start or pt["ts"] > now:
+                continue
+            i = int((pt["ts"] - start) / width)
+            i = 0 if i < 0 else (nb - 1 if i >= nb else i)
+            cost[i] += pt["cost"]
+            toks += pt["total"]
+        out[name] = {"label": _COST_LABEL[name], "points": [round(c, 4) for c in cost],
+                     "total": round(sum(cost), 4), "tokens": toks, "axis": _cost_axis(name, now)}
+    ycost, ytok = _year_buckets(pts, now)
+    out["year"] = {"label": _COST_LABEL["year"], "points": [round(c, 4) for c in ycost],
+                   "total": round(sum(ycost), 4), "tokens": ytok, "axis": _cost_axis("year", now)}
+    _SERIES_CACHE["ts"] = now
+    _SERIES_CACHE["data"] = out
+    _SERIES_CACHE["sig"] = sig
+    _SERIES_CACHE["generation"] = generation
+    _SERIES_CACHE["pricing_version"] = pricing_version
+    return out
 
 
 def snapshot():
@@ -794,23 +1226,33 @@ def snapshot():
             "prompt": (s["prompt"] or s["last_msg"] or "(session)")[:500],
             "n_cmds": s["n_cmds"], "n_edits": s["n_edits"], "files": s["files"][:4],
             "rate_pct": s["rate_pct"], "tokens": s["tokens"], "token_total": s["tokens"].get("total", 0),
-            "cost": s["tokens"].get("cost", 0.0), "errors": s["errors"][:2],
+            "cost": s["tokens"].get("cost", 0.0), "cost_estimate": s["tokens"].get("cost_estimate", False),
+            "cost_note": s["tokens"].get("cost_note", ""), "errors": s["errors"][:2],
         })
     recent = recent[:RECENT_LIMIT]
 
     today = time.strftime("%Y/%m/%d")
     try:
-        today_n = len(glob.glob(os.path.join(SESS, today, "*.jsonl")))
+        today_files = glob.glob(os.path.join(SESS, today, "*.jsonl"))
     except Exception:
-        today_n = len(sessions)
-    max_rate = max([s["rate_pct"] for s in sessions if s["rate_pct"] is not None] + [0])
-    token_total = sum((s.get("tokens") or {}).get("total", 0) for s in sessions)
-    cost_total = round(sum((s.get("tokens") or {}).get("cost", 0.0) for s in sessions), 4)
+        today_files = []
+    today_n = len(today_files)
+    today_sessions = _parse_session_files(sorted(today_files, key=_mtime, reverse=True))
+    rate = _latest_active_rate(sessions, "rate_primary", now)
+    rate7d = _latest_active_rate(sessions, "rate_secondary", now)
+    token_total_recent = sum((s.get("tokens") or {}).get("total", 0) for s in sessions)
+    cost_total_recent = round(sum((s.get("tokens") or {}).get("cost", 0.0) for s in sessions), 4)
+    token_total = sum((s.get("tokens") or {}).get("total", 0) for s in today_sessions)
+    cost_total = round(sum((s.get("tokens") or {}).get("cost", 0.0) for s in today_sessions), 4)
+    cost_estimate = any((s.get("tokens") or {}).get("cost_estimate") for s in today_sessions)
+    # Counts only live rows derived from the current ps codex process list.
     status_counts = {k: sum(1 for j in running if j["status"] == k) for k in ("running", "zombie", "error", "done", "killed", "interrupted")}
     return {"ts": time.strftime("%H:%M:%S"), "date": time.strftime("%a %d %b %Y").upper(),
-            "count": len(running), "today": today_n, "rate": max_rate,
+            "count": len(running), "today": today_n, "rate": rate, "rate7d": rate7d,
             "stale_sec": ACTIVE_STALE_SEC, "status_counts": status_counts,
-            "token_total": token_total, "cost_total": cost_total,
+            "token_total": token_total, "cost_total": cost_total, "cost_estimate": cost_estimate,
+            "token_total_recent": token_total_recent, "cost_total_recent": cost_total_recent,
+            "cost_series": cost_series(now),
             "running": running, "feed": feed, "recent": recent}
 
 
@@ -928,8 +1370,55 @@ body{
 .lamp{width:11px;height:11px;border-radius:50%;background:#c3ad81}
 .lamp.on{background:var(--ember);animation:pulse 1.5s infinite}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(207,89,21,.55)}70%{box-shadow:0 0 0 11px rgba(207,89,21,0)}100%{box-shadow:0 0 0 0 rgba(207,89,21,0)}}
+.ratetog{display:inline-flex;margin-left:8px;border:1px solid #c2aa78;background:#fbf3e1;vertical-align:middle}
+.ratetog button{appearance:none;cursor:pointer;border:0;border-left:1px solid #ddcaa0;background:transparent;
+  font:700 9px "Saira Condensed",sans-serif;letter-spacing:.1em;text-transform:uppercase;color:#6b5638;
+  padding:2px 6px;line-height:1.35;transition:background .15s,color .15s}
+.ratetog button:first-child{border-left:0}
+.ratetog button.on{background:#33271a;color:#f1e7d2}
+.ratetog button:hover:not(.on){background:#f1e3c6;color:#2a1d10}
 .gauge{height:5px;background:#ddcba8;margin-top:9px;overflow:hidden}
 .gauge i{display:block;height:100%;background:linear-gradient(90deg,var(--ember),#e8893f);transition:width .6s}
+
+.costwrap{position:relative;margin:14px 0 6px;border:1px solid #cbb588;
+  background:linear-gradient(180deg,#f3e8cf 0%,#ece0c6 100%);overflow:hidden;height:138px}
+.costwrap:after{content:"";position:absolute;left:0;right:0;bottom:0;height:1px;background:#d8c7a4;z-index:1}
+.costgraph{position:absolute;inset:0;width:100%;height:100%;display:block;
+  transition:opacity .28s ease;animation:costin .55s ease both}
+@keyframes costin{from{opacity:0}to{opacity:1}}
+.costline{stroke:var(--ember);stroke-width:2.2;fill:none;stroke-linejoin:miter;stroke-linecap:butt}
+.costarea{fill:url(#costfill);stroke:none}
+.costbase{stroke:#cbb588;stroke-width:1;stroke-dasharray:2 5;vector-effect:non-scaling-stroke;opacity:.6}
+.costguide{stroke:#b79b6a;stroke-width:1;vector-effect:non-scaling-stroke;opacity:.26}
+.costguide.now{stroke:var(--ember2);opacity:.5;stroke-dasharray:2.5 2.5}
+.costaxis{position:absolute;left:0;right:0;bottom:4px;height:13px;z-index:2;pointer-events:none}
+.costaxis span{position:absolute;transform:translateX(-50%);font:9px "Saira Condensed",sans-serif;
+  letter-spacing:.1em;text-transform:uppercase;color:var(--faint);white-space:nowrap}
+.costaxis span.now{color:var(--ember2);font-weight:700}
+.costgrid{stroke:#b79b6a;stroke-width:1;vector-effect:non-scaling-stroke;opacity:.16}
+.costgridlab{position:absolute;inset:0;z-index:2;pointer-events:none}
+.costgridlab span{position:absolute;right:7px;transform:translateY(-50%);font:9px "JetBrains Mono",monospace;color:var(--faint);opacity:.8}
+.costface{position:relative;z-index:2;display:flex;align-items:flex-start;justify-content:space-between;
+  gap:14px;padding:14px 20px 22px;height:100%;pointer-events:none}
+.costface .costtoggle{pointer-events:auto}
+.costmeta{display:flex;flex-direction:column;gap:4px}
+.costmeta .l{font-family:"Saira Condensed",sans-serif;text-transform:uppercase;letter-spacing:.26em;
+  font-size:10px;color:var(--dim)}
+.costmeta .l span{color:var(--ember2)}
+.costnum{font-family:"Bodoni Moda",serif;font-weight:600;font-variant-numeric:tabular-nums;
+  font-size:clamp(40px,6.2vw,58px);line-height:.9;color:#2a1d10;text-shadow:0 1px 0 rgba(255,250,238,.6)}
+.costnum .cur{font-size:.46em;color:var(--dim);vertical-align:.42em;margin-right:3px;font-weight:600}
+.costsub{font:11px "JetBrains Mono",monospace;color:var(--dim);letter-spacing:.02em}
+.costsub b{color:#4a3925;font-weight:600}
+.costtoggle{display:inline-flex;border:1px solid #c2aa78;background:#fbf3e1;align-self:flex-start;
+  box-shadow:0 1px 0 rgba(255,250,238,.5)}
+.costtoggle button{appearance:none;cursor:pointer;border:0;border-left:1px solid #ddcaa0;background:transparent;
+  font:700 11px "Saira Condensed",sans-serif;letter-spacing:.16em;text-transform:uppercase;color:#6b5638;
+  padding:6px 11px;transition:background .15s,color .15s}
+.costtoggle button:first-child{border-left:0}
+.costtoggle button.on{background:#33271a;color:#f1e7d2}
+.costtoggle button:hover:not(.on){background:#f1e3c6;color:#2a1d10}
+@media(max-width:640px){.costwrap{height:124px}.costnum{font-size:36px}.costtoggle button{padding:6px 8px;letter-spacing:.1em}.costface{padding:12px 14px}}
 
 .controls{display:flex;flex-wrap:wrap;gap:9px;align-items:center;margin:16px 0 8px;padding:10px;border:1px solid #cfbc91;background:#f8f1e2}
 .controls label{font-family:"Saira Condensed",sans-serif;text-transform:uppercase;letter-spacing:.18em;color:var(--dim);font-size:10px}
@@ -1023,6 +1512,10 @@ body{
 .wline .wx{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#3a2c1c;font-size:11.5px}
 .wline.cmd .wi{color:var(--wire)} .wline.edit .wi{color:var(--ember2)} .wline.msg .wi{color:var(--blue);font-style:italic}
 .wline.err{background:#fae5dc}.wline.err .wi,.wline.err .wx{color:var(--bad);font-weight:700}.wline.out{opacity:.55}
+.wline.clip{cursor:pointer}
+.wline.clip:hover{background:#f1e3c6}
+.wline.expanded{background:#f3ead6;align-items:flex-start}
+.wline.expanded .wx{white-space:normal;overflow:visible;text-overflow:clip;word-break:break-word}
 .wi{width:14px;flex:none;text-align:center}
 
 .rec{display:flex;gap:14px;align-items:baseline;padding:10px 0;border-bottom:1px solid #ddcba8}
@@ -1067,24 +1560,55 @@ footer{margin-top:40px;color:var(--faint);font-size:10.5px;border-top:1px solid 
 </div>
 
 <div class=strip>
-  <div class=stat><div class=l>Running</div><div class=v id=s_run>—</div></div>
-  <div class=stat><div class=l>Today</div><div class=v id=s_today>—</div></div>
-  <div class=stat><div class=l>Rate 5h</div><div class=v id=s_rate>—<small>%</small></div><div class=gauge><i id=s_rate_bar style=width:0%></i></div></div>
-  <div class=stat><div class=l>Cost</div><div class=v id=s_tokens>—</div></div>
-  <div class=stat><div class=l>Wire lines</div><div class=v id=s_feed>—</div></div>
+  <div class=stat title="running codex processes from ps"><div class=l>Live</div><div class=v id=s_run>—</div></div>
+  <div class=stat title="오늘 생성된 codex 세션 파일 수"><div class=l>Sessions today</div><div class=v id=s_today>—</div></div>
+  <div class=stat><div class=l>Rate<span class=ratetog id=rate_toggle><button type=button data-rw=5h class=on>5h</button><button type=button data-rw=7d>7d</button></span></div><div class=v id=s_rate>—<small>%</small></div><div class=gauge><i id=s_rate_bar style=width:0%></i></div></div>
+  <div class=stat title="feed from sessions active in last 30m, capped at 80 lines"><div class=l>Wire feed</div><div class=v id=s_feed>—</div></div>
+</div>
+
+<div class=costwrap id=costwrap>
+  <svg class=costgraph id=costgraph viewBox="0 0 100 100" preserveAspectRatio=none aria-hidden=true>
+    <defs>
+      <linearGradient id=costfill x1=0 y1=0 x2=0 y2=1>
+        <stop offset="0%" stop-color="#cf5915" stop-opacity="0.34"/>
+        <stop offset="55%" stop-color="#cf5915" stop-opacity="0.10"/>
+        <stop offset="100%" stop-color="#cf5915" stop-opacity="0"/>
+      </linearGradient>
+    </defs>
+    <g id=costgridh></g>
+    <g id=costguides></g>
+    <path id=costarea class=costarea d=""/>
+    <path id=costline class=costline d="" vector-effect=non-scaling-stroke pathLength="1"/>
+  </svg>
+  <div class=costaxis id=costaxis></div>
+  <div class=costgridlab id=costgridlab></div>
+  <div class=costface>
+    <div class=costmeta>
+      <div class=l>Codex spend · <span id=cost_range_label>5h session</span></div>
+      <div class=costnum><span class=cur>$</span><span id=cost_amount>0.00</span></div>
+      <div class=costsub><b id=cost_tokens>—</b> tok · peak <b id=cost_peak>$0.00</b><span id=cost_estflag></span></div>
+    </div>
+    <div class=costtoggle id=cost_toggle role=tablist aria-label="cost timeframe">
+      <button type=button data-range=5h class=on>5H</button>
+      <button type=button data-range=day>Day</button>
+      <button type=button data-range=week>Wk</button>
+      <button type=button data-range=month>Mo</button>
+      <button type=button data-range=year>Yr</button>
+    </div>
+  </div>
 </div>
 
 <div class=controls>
   <label>dir</label><select id=f_dir><option value="">all</option></select>
   <label>sandbox</label><select id=f_sandbox><option value="">all</option></select>
-  <label>status</label><select id=f_status><option value="">all</option><option>running</option><option>zombie</option><option>error</option><option>done</option><option>killed</option><option>interrupted</option></select>
+  <label>status</label><select id=f_status><option value="">all</option><option>running</option><option value=zombie>stale</option><option>error</option><option>done</option><option>killed</option><option>interrupted</option></select>
   <label>sort</label><select id=f_sort><option value=elapsed>elapsed</option><option value=edits>edits</option><option value=tokens>tokens</option><option value=activity>last activity</option></select>
   <input id=f_q placeholder="prompt · file · pid search">
   <label>poll</label><select id=poll_ms><option value=1000>1s</option><option value=2000 selected>2s</option><option value=5000>5s</option><option value=10000>10s</option></select>
   <button id=refresh_btn>refresh</button><button id=compact_btn>compact</button><button id=clear_state_btn>clear all</button>
   <div class=notify-panel id=notify_panel aria-label="notification controls">
     <label class="switch master"><input id=n_master type=checkbox><span class=track><span class=thumb></span></span><span class=switch-text><b>alerts</b><small>master</small></span></label>
-    <label class=switch><input id=n_zombie type=checkbox><span class=track><span class=thumb></span></span><span class=switch-text><b>zombie</b><small>status</small></span></label>
+    <label class=switch title="alert when a live Codex process has a stale activity signal"><input id=n_zombie type=checkbox><span class=track><span class=thumb></span></span><span class=switch-text><b>stale</b><small>signal</small></span></label>
     <label class=switch><input id=n_error type=checkbox><span class=track><span class=thumb></span></span><span class=switch-text><b>error</b><small>logs</small></span></label>
     <label class=switch><input id=n_rate type=checkbox><span class=track><span class=thumb></span></span><span class=switch-text><b>rate</b><small>limit</small></span></label>
     <label class=threshold title="rate alert percent"><span>at</span><input id=n_rate_limit class=mini type=number min=50 max=100 value=80><span>%</span></label>
@@ -1095,7 +1619,7 @@ footer{margin-top:40px;color:var(--faint);font-size:10.5px;border-top:1px solid 
   <span class=refresh-note id=refresh_note>—</span>
 </div>
 
-<div class=sec><span class=ko>● Running</span><h2>On the Wire</h2><div class=rule></div></div>
+<div class=sec><span class=ko title="running codex processes from ps">● Live processes</span><h2>On the Wire</h2><div class=rule></div></div>
 <div class=grid id=running></div>
 
 <div class=sec><span class=ko>Wire feed</span><h2>Live Telegraph</h2><div class=rule></div></div>
@@ -1110,6 +1634,8 @@ footer{margin-top:40px;color:var(--faint);font-size:10.5px;border-top:1px solid 
 <script>
 const ICON={cmd:'●',edit:'✎',msg:'»',err:'!',out:'·'};
 const STATUS_ICON={running:'●',zombie:'!',error:'×',done:'✓',killed:'■',interrupted:'!'};
+function statusDisplay(j){return j&&j.status==='zombie'?'stale':((j&&j.status_label)||((j&&j.status)||''));}
+function costNote(j){return j&&j.cost_estimate?' <small style=color:var(--dim)>est:fallback</small>':' <small style=color:var(--dim)>est</small>';}
 function esc(s){return String(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function hhmm(iso){try{const d=new Date(iso);return d.toLocaleTimeString('en-GB',{hour12:false});}catch(e){return '';}}
 function fmtAge(s){if(s==null)return 'no events'; if(s<60)return s+'s ago'; const m=Math.floor(s/60); if(m<60)return m+'m ago'; return Math.floor(m/60)+'h '+(m%60)+'m ago';}
@@ -1127,6 +1653,96 @@ function toast(msg, kind='ok'){
   requestAnimationFrame(()=>el.classList.add('show'));
   setTimeout(()=>{el.classList.add('hide');el.classList.remove('show');},2100);
   setTimeout(()=>el.remove(),2450);
+}
+function renderRateStat(value, valueId, barId){
+  const n=Number(value), ok=Number.isFinite(n);
+  setHTML(document.getElementById(valueId),(ok?Math.round(n):'—')+'<small>%</small>');
+  document.getElementById(barId).style.width=(ok?Math.min(100,Math.max(0,n)):0)+'%';
+}
+let rateWin='5h';
+try{const rw=localStorage.getItem('codex-wire-rate-win'); if(rw==='5h'||rw==='7d')rateWin=rw;}catch(e){}
+function renderRate(d){renderRateStat(rateWin==='7d'?d.rate7d:d.rate,'s_rate','s_rate_bar');}
+function setRateWin(w){
+  if(w!=='5h'&&w!=='7d')return;
+  rateWin=w;
+  try{localStorage.setItem('codex-wire-rate-win',w);}catch(e){}
+  const t=document.getElementById('rate_toggle');
+  if(t)[...t.querySelectorAll('button')].forEach(b=>b.classList.toggle('on',b.dataset.rw===w));
+  if(latest)renderRate(latest);
+}
+const COST_LABEL={'5h':'5h session','day':'last 24h','week':'last 7 days','month':'last 30 days','year':'last 12 months'};
+let costRange='5h';
+try{const cr=localStorage.getItem('codex-wire-cost-range'); if(cr&&COST_LABEL[cr])costRange=cr;}catch(e){}
+// Sharp (no smoothing) area path in a 0..100 viewBox; non-scaling stroke keeps
+// the line crisp while the area stretches to the panel.
+function costPath(points){
+  const n=points.length;
+  if(!n)return {line:'',area:''};
+  const max=Math.max.apply(null,points.concat(0))||1;
+  const W=100,H=100,top=14;                 // headroom so the peak isn't clipped
+  const dx=n>1?W/(n-1):0;
+  const pt=points.map((v,i)=>{
+    const x=n>1?i*dx:W/2;
+    const y=H-(Math.max(0,v)/max)*(H-top);
+    return [Math.round(x*100)/100,Math.round(y*1000)/1000];
+  });
+  const line=pt.map((p,i)=>(i?'L':'M')+p[0]+' '+p[1]).join(' ');
+  const area=(n>1?line:('M0 '+pt[0][1]+' L100 '+pt[0][1]))+
+    ' L'+(n>1?W:100)+' '+H+' L'+(n>1?0:0)+' '+H+' Z';
+  return {line,area};
+}
+function renderCost(d){
+  const series=d&&d.cost_series; if(!series)return;
+  const r=series[costRange]||series['5h']||{points:[],total:0,tokens:0};
+  const pts=r.points||[];
+  setText(document.getElementById('cost_amount'),Number(r.total||0).toFixed(2));
+  setText(document.getElementById('cost_range_label'),COST_LABEL[costRange]||r.label||'');
+  setText(document.getElementById('cost_tokens'),fmtTok(r.tokens||0));
+  const peak=pts.length?Math.max.apply(null,pts):0;
+  setText(document.getElementById('cost_peak'),'$'+Number(peak).toFixed(2));
+  setText(document.getElementById('cost_estflag'),d.cost_estimate?' · est':'');
+  const p=costPath(pts);
+  const lEl=document.getElementById('costline'),aEl=document.getElementById('costarea');
+  if(lEl)lEl.setAttribute('d',p.line);
+  if(aEl)aEl.setAttribute('d',p.area);
+  renderCostAxis(r.axis);
+  renderCostGrid(peak);
+}
+// horizontal cost gridlines at "nice" values below the peak (same y-map as costPath)
+function costGrid(peak){
+  if(!(peak>0))return [];
+  const rough=peak/3, mag=Math.pow(10,Math.floor(Math.log10(rough)))||1, norm=rough/mag;
+  const step=(norm>=5?5:norm>=2?2:1)*mag, out=[];
+  for(let v=step; v<peak*0.94 && out.length<4; v+=step)out.push(v);
+  return out;
+}
+function fmtCostShort(v){return v>=10?String(Math.round(v)):v>=1?v.toFixed(1):v.toFixed(2);}
+function renderCostGrid(peak){
+  const g=document.getElementById('costgridh'),lab=document.getElementById('costgridlab');
+  const vals=costGrid(peak),H=100,top=14;
+  const y=v=>H-(v/peak)*(H-top);
+  if(g)g.innerHTML=vals.map(v=>`<line class=costgrid x1="0" y1="${y(v).toFixed(2)}" x2="100" y2="${y(v).toFixed(2)}"/>`).join('');
+  if(lab)lab.innerHTML=vals.map(v=>`<span style="top:${y(v).toFixed(2)}%">$${fmtCostShort(v)}</span>`).join('');
+}
+function renderCostAxis(axis){
+  const g=document.getElementById('costguides'),lab=document.getElementById('costaxis');
+  if(!Array.isArray(axis)){if(g)g.innerHTML='';if(lab)lab.innerHTML='';return;}
+  if(g)g.innerHTML=axis.map(a=>{const x=(a.x*100).toFixed(2);const now=a.label==='now';
+    return `<line class="costguide${now?' now':''}" x1="${x}" y1="0" x2="${x}" y2="100"/>`;}).join('');
+  if(lab)lab.innerHTML=axis.map(a=>{const now=a.label==='now';let style;
+    if(a.x<=0.02)style='left:4px';else if(a.x>=0.98)style='left:auto;right:4px;transform:none';
+    else style='left:'+(a.x*100).toFixed(2)+'%';
+    return `<span class="${now?'now':''}" style="${style}">${esc(a.label)}</span>`;}).join('');
+}
+function setCostRange(range){
+  if(!COST_LABEL[range])return;
+  costRange=range;
+  try{localStorage.setItem('codex-wire-cost-range',range);}catch(e){}
+  const tog=document.getElementById('cost_toggle');
+  if(tog)[...tog.querySelectorAll('button')].forEach(b=>b.classList.toggle('on',b.dataset.range===range));
+  const g=document.getElementById('costgraph');
+  if(g){g.style.opacity='0';setTimeout(()=>{if(latest)renderCost(latest);g.style.opacity='';},120);}
+  else if(latest)renderCost(latest);
 }
 let ticks={}, seen=new Set(), latest=null, pollMs=2000, timer=null, lastOk=0;
 let expanded=new Set(), promptOpen=new Set(), pins=new Set();
@@ -1177,7 +1793,7 @@ function promptBlock(j){
   return p?`<div class="prompt ${open?'open':''}" data-field=prompt>${p}</div><button class=toggle-more data-act=prompt>${open?'Collapse':'More'}</button>`:'';
 }
 function telem(j){
-  return `<span class=m><b>${j.n_cmds||0}</b>cmds</span><span class=m><b>${j.n_edits||0}</b>edits</span><span class=m><b>${fmtTok(j.token_total)}</b>tok</span><span class=m><b>$${Number(j.cost||0).toFixed(3)}</b>est</span>${j.rate_pct!=null?`<span class=m><b>${Math.round(j.rate_pct)}</b><small style=color:var(--dim)>% rate</small></span>`:''}`;
+  return `<span class=m><b>${j.n_cmds||0}</b>cmds</span><span class=m><b>${j.n_edits||0}</b>edits</span><span class=m><b>${fmtTok(j.token_total)}</b>tok</span><span class=m><b>$${Number(j.cost||0).toFixed(3)}</b>${costNote(j)}</span>${j.rate_pct!=null?`<span class=m><b>${Math.round(j.rate_pct)}</b><small style=color:var(--dim)>% rate</small></span>`:''}`;
 }
 function feedHTML(events){
   return (events||[]).slice().reverse().map(e=>`<div class=ev><span class="ic ${e.k}">${ICON[e.k]||'·'}</span><span class=tx>${esc(e.t)}</span></div>`).join('');
@@ -1195,7 +1811,7 @@ function activityHTML(j){
   const a=j.activity||{}, c=Number(a.confidence||0), cls=c>=80?'high':(c>=50?'med':'low');
   const bits=[`pid ${a.pid_alive?'alive':'gone'}`,`event ${fmtAge(a.last_event_age_sec)}`];
   if(a.long_op)bits.push('long cmd');
-  return `<span class="signal ${cls}" title="${esc(a.reason||'')}">${esc(a.label||'live')} · z${c}% · ${esc(bits.join(' · '))}</span>`;
+  return `<span class="signal ${cls}" title="${esc(a.reason||'stale signal risk')}">${esc(a.label||'live')} · signal ${c}% · ${esc(bits.join(' · '))}</span>`;
 }
 function detailsHTML(j){
   const outs=(j.outputs||[]).slice().reverse().map(o=>`<h3>output ${o.exit_code!=null?'exit '+o.exit_code:''}</h3><pre class="${o.exit_code?'err':''}">${esc(o.output)}</pre>`).join('');
@@ -1236,7 +1852,7 @@ function patchCard(el,j){
   el.className='card '+j.status; ticks[j.pid]=j.elapsed;
   const files=(j.files||[]).map(f=>`<span class=fchip>${esc(f)}</span>`).join('');
   setHTML(el,`<div class=hd>
-     <span class="pill ${j.status}"><span class=d></span>${STATUS_ICON[j.status]||'·'} ${esc(j.status_label||j.status)} ${esc(j.pid)}</span>
+     <span class="pill ${j.status}" title="${esc(j.status_label||j.status)}"><span class=d></span>${STATUS_ICON[j.status]||'·'} ${esc(statusDisplay(j))} ${esc(j.pid)}</span>
      <span class=kv>dir <b>${esc(j.cwd)}</b></span>
      <span class="kv prompt-head">${esc((j.prompt||'').replace(/\s+/g,' ').slice(0,90))}</span>
      <span class=chip>${esc(j.sandbox)}</span><span class=stage>${esc(j.stage)}</span>${activityHTML(j)}${errBadges(j)}
@@ -1276,6 +1892,7 @@ function renderWire(feed){
     const div=document.createElement('div'); div.className='wline '+e.k;
     div.innerHTML=`<span class=wt>${hhmm(e.ts)}</span><span class=wi>${ICON[e.k]||'·'}</span><span class=src>${esc(e.src)}</span><span class=wx>${esc(e.t)}</span>`;
     W.insertBefore(div, W.firstChild);
+    const wx=div.querySelector('.wx'); if(wx && wx.scrollWidth>wx.clientWidth+1) div.classList.add('clip');
   }
   while(W.children.length>80) W.removeChild(W.lastChild);
   if(seen.size>600){ seen=new Set(feed.map(e=>e.ts+'|'+e.k+'|'+e.t+'|'+e.src)); }
@@ -1285,7 +1902,7 @@ function renderRecent(rows){
   setHTML(RE,rows.map(s=>`<div class="rec ${s.status}">
      <span class=ago>${fmtRecentAge(s.age_min)}</span><span class=src>${esc(s.cwd)}</span>
      <span class=p>${esc(s.prompt)}</span>
-     <span class=n>${esc(s.status_label||s.status)} · ${s.n_cmds}c · ${s.n_edits}e · ${fmtTok(s.token_total)}t · $${Number(s.cost||0).toFixed(3)}${s.rate_pct!=null?' · '+Math.round(s.rate_pct)+'%':''}</span></div>`).join('')||'<div class=empty>No history.</div>');
+     <span class=n>${esc(statusDisplay(s))} · ${s.n_cmds}c · ${s.n_edits}e · ${fmtTok(s.token_total)}t · $${Number(s.cost||0).toFixed(3)}${s.cost_estimate?' est:fallback':''}${s.rate_pct!=null?' · '+Math.round(s.rate_pct)+'%':''}</span></div>`).join('')||'<div class=empty>No history.</div>');
 }
 async function postJSON(url,payload){
   const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
@@ -1353,7 +1970,7 @@ function maybeAlerts(d){
   const o=notifyOptions(); if(!alertsPrimed){primeAlerts(d);return;}
   for(const j of d.running||[]){
     const k=stableId(j), name=(j.cwd||j.pid||'job');
-    if(o.zombie&&j.status==='zombie'&&statusSeen[k]!=='zombie')alertUser('zombie:'+k,'CODEX zombie',name+' · '+((j.activity||{}).label||'silent'),'bad');
+    if(o.zombie&&j.status==='zombie'&&statusSeen[k]!=='zombie')alertUser('zombie:'+k,'CODEX stale signal',name+' · '+((j.activity||{}).label||'silent'),'bad');
     statusSeen[k]=j.status;
     const esig=(j.errors||[]).map(e=>e.ts+'|'+e.label+'|'+e.output).join(';');
     if(o.error&&esig&&errorSeen[k]!==esig)alertUser('error:'+k+':'+esig,'CODEX error',name+' · '+((j.errors||[]).slice(-1)[0]||{}).label,'bad');
@@ -1396,10 +2013,9 @@ async function tick(manual=false){
   setText(document.getElementById('onair'),d.count>0?'ON AIR':'STANDBY');
   document.getElementById('onair').style.color=d.count>0?'var(--ember)':'var(--dim)';
   setText(document.getElementById('s_run'),d.count); setText(document.getElementById('s_today'),d.today);
-  setHTML(document.getElementById('s_rate'),Math.round(d.rate)+'<small>%</small>');
-  document.getElementById('s_rate_bar').style.width=Math.min(100,d.rate)+'%';
-  setHTML(document.getElementById('s_tokens'),fmtTok(d.token_total)+'<small> $'+Number(d.cost_total||0).toFixed(2)+'</small>');
+  renderRate(d);
   setText(document.getElementById('s_feed'),d.feed.length);
+  renderCost(d);
   renderControls(d); renderCards(); renderWire(d.feed); renderRecent(d.recent); maybeAlerts(d);
   setText(document.getElementById('refresh_note'),(manual?'manual · ':'')+'updated now');
  }catch(e){setText(document.getElementById('ts'),'connection lost');setText(document.getElementById('onair'),'LINE DOWN');}
@@ -1418,6 +2034,15 @@ document.getElementById('poll_ms').addEventListener('change',e=>{pollMs=Number(e
 document.getElementById('refresh_btn').addEventListener('click',()=>tick(true));
 document.getElementById('compact_btn').addEventListener('click',e=>{document.body.classList.toggle('compact');e.target.classList.toggle('on',document.body.classList.contains('compact'));saveState();});
 document.getElementById('clear_state_btn').addEventListener('click',clearState);
+document.getElementById('cost_toggle').addEventListener('click',e=>{const b=e.target.closest('button[data-range]');if(b)setCostRange(b.dataset.range);});
+[...document.querySelectorAll('#cost_toggle button')].forEach(b=>b.classList.toggle('on',b.dataset.range===costRange));
+document.getElementById('rate_toggle').addEventListener('click',e=>{const b=e.target.closest('button[data-rw]');if(b)setRateWin(b.dataset.rw);});
+[...document.querySelectorAll('#rate_toggle button')].forEach(b=>b.classList.toggle('on',b.dataset.rw===rateWin));
+document.getElementById('wire').addEventListener('click',e=>{
+  const line=e.target.closest('.wline'); if(!line)return;
+  const wx=line.querySelector('.wx'); if(!wx)return;
+  if(line.classList.contains('expanded')||wx.scrollWidth>wx.clientWidth+1){line.classList.add('clip');line.classList.toggle('expanded');}
+});
 ['n_master','n_zombie','n_error','n_rate','n_idle','n_rate_limit','n_idle_min'].forEach(id=>document.getElementById(id).addEventListener('input',()=>{setNotifyUiState();requestNotifyIfNeeded();saveNotifyState();}));
 tick();startPoll();
 </script></body></html>"""
