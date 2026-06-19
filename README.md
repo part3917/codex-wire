@@ -6,15 +6,17 @@ Live telemetry + dispatch wrapper for the OpenAI Codex CLI, driven by Claude Cod
 
 ![codex-wire dashboard](assets/00-dashboard.png)
 
+<!-- Screenshot refresh needed: assets/*.png may lag the current UI. -->
+
 ## What It Does
 
 - `dispatch.sh` runs one `codex exec` job, detects completion through its unique `--output-last-message` file, then reaps the lingering process that can remain after Codex has finished.
-- `codex_monitor.py` is a stdlib-only web dashboard at `http://localhost:8787`. It reads `ps` plus `~/.codex/sessions` to show live jobs, recent sessions, activity, tokens, and dispatch state.
+- `codex_monitor.py` is a Python-stdlib-only web dashboard at `http://localhost:8787`. It reads `ps` plus `~/.codex/sessions` to show live jobs, recent sessions, activity, tokens, spend, and dispatch state.
 - `codex-instructions` is an optional launcher that points Codex at an instructions file via `CODEX_INSTRUCTIONS_FILE`.
 
 ## The Dashboard
 
-A stdlib-only web UI at `http://localhost:8787` — no database, no dependencies. It polls `ps` and `~/.codex/sessions` on an interval and renders every delegated Codex job as it happens. Here is what each section does, top to bottom.
+A Python-stdlib-only web UI at `http://localhost:8787` — no database and no Python package dependencies. The browser loads Google Fonts externally. The monitor polls `ps` and the Codex session directory on an interval and renders every delegated Codex job as it happens. Here is what each section does, top to bottom.
 
 ### Masthead & Stats
 
@@ -22,15 +24,29 @@ A stdlib-only web UI at `http://localhost:8787` — no database, no dependencies
 
 The masthead shows the dashboard identity, the current date/time, and refresh freshness. The broadcast light reads **`ON AIR`** whenever at least one job is running, and **`STANDBY`** when nothing is live.
 
-Below it, five at-a-glance tiles:
+Below it, four at-a-glance stats plus a separate Codex spend panel:
 
-| Tile | Meaning |
+| Stat | Meaning |
 |------|---------|
-| **RUNNING** | Number of currently detected running `codex exec` jobs. |
-| **TODAY** | Codex sessions started today (JSONL files under `~/.codex/sessions/YYYY/MM/DD/`). |
-| **RATE 5H** | Highest rate-limit usage (`primary.used_percent`) seen across scanned recent sessions, as a percent + gauge. |
-| **COST** | Total scanned tokens plus estimated cost, using the configured token pricing. |
-| **WIRE LINES** | Number of event rows currently in the live feed. |
+| **Live** | Number of currently detected running `codex exec` jobs from `ps`. |
+| **Sessions today** | Codex sessions started today (JSONL files under `~/.codex/sessions/YYYY/MM/DD/`, or the configured session root). |
+| **Rate** | Highest observed rate-limit usage as a percent + gauge. The inline toggle switches between **5h** (`primary`, the five-hour window) and **7d** (`secondary`, the weekly window). The selected window is remembered in `localStorage`. |
+| **Wire feed** | Number of event rows currently in the live feed, from sessions active in the recent feed window. |
+
+### Codex Spend Panel
+
+The spend panel is separate from the top stats. It estimates Codex spend from `token_count` events and the fixed monitor pricing table: `gpt-5.5` at **$5.00 / 1M input tokens**, **$0.50 / 1M cached input tokens**, and **$30.00 / 1M output tokens**. If a session reports an unknown or missing model, the monitor falls back to `gpt-5.5` pricing.
+
+The panel includes:
+
+| Control / view | Meaning |
+|----------------|---------|
+| **5H / Day / Wk / Mo / Yr** | Timeframe tabs for the rolling five-hour, 24-hour, seven-day, 30-day, and 12-month spend windows. The selected timeframe is remembered in `localStorage`. |
+| **Sharp area graph** | A non-smoothed area chart of per-bucket spend for the selected timeframe. |
+| **Horizontal grid** | Dynamic "nice" dollar gridlines based on the current peak bucket. |
+| **Time axis** | Vertical guide marks and labels for the selected window, including `now` where applicable. |
+| **Hover detail** | Mouse hover shows a vertical guide line, point marker, and tooltip with the bucket time plus dollar amount. |
+| **`est` / `est:fallback`** | `est` means the amount is an estimate derived from token usage. `est:fallback` means the estimate used fallback `gpt-5.5` pricing because the session model was unknown or unsupported. |
 
 ### Controls & Alerts
 
@@ -83,7 +99,7 @@ The logbook at the bottom of the same view (shown above): recently finished, non
 - [Claude Code](https://claude.com/claude-code) — the intended driver that delegates jobs to Codex (`dispatch.sh` can also be run on its own).
 - OpenAI Codex CLI installed.
 - `codex login` completed.
-- Python 3.
+- Python 3.7+ (`ThreadingHTTPServer` and `subprocess.run(..., text=True)` are used).
 
 ## Install
 
@@ -92,6 +108,12 @@ git clone https://github.com/part3917/codex-wire.git codex-wire
 cd codex-wire
 ./install.sh
 ```
+
+What `install.sh` does:
+
+- Installs the dispatch wrapper at `~/.codex/dispatch.sh` by linking it to this clone's `dispatch.sh`.
+- Creates `.env` from `.env.example` when `.env` does not already exist; existing `.env` files are never overwritten.
+- Installs the `/codex` Claude Code command from `examples/codex.md` to `~/.claude/commands/codex.md` when that file does not already exist.
 
 Manual setup:
 
@@ -120,7 +142,7 @@ Example:
 Run the monitor:
 
 ```bash
-python3 codex_monitor.py
+python3 <clone-dir>/codex_monitor.py
 ```
 
 Then open `http://localhost:8787`.
@@ -145,7 +167,10 @@ Copy `.env.example` to `.env` and edit values as needed. The main knobs are:
 
 - `CODEX_INSTRUCTIONS_FILE`: optional instructions file for `codex-instructions`.
 - `CODEX_WIRE_OUTDIR`: output directory for dispatch summaries and logs.
-- `CODEX_MONITOR_*`: dashboard scan limits, stale thresholds, token cost estimates, bind host/port, and retry command.
+- `CODEX_MONITOR_SESS_DIR`: Codex session JSONL root override. Default: `~/.codex/sessions`.
+- `CODEX_MONITOR_*`: dashboard scan limits, stale thresholds, bind host/port, tracking file, retry command, and session root.
+
+Spend estimates use the fixed pricing table built into `codex_monitor.py`; token pricing is not configured through `.env`.
 
 ## Attribution
 

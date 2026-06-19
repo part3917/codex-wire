@@ -6,15 +6,17 @@ OpenAI Codex CLI를 위한 실시간 텔레메트리 + 디스패치 래퍼로, C
 
 ![codex-wire 대시보드](assets/00-dashboard.png)
 
+<!-- 스크린샷 갱신 필요: assets/*.png는 현재 UI보다 오래되었을 수 있습니다. -->
+
 ## 무엇을 하나요
 
 - `dispatch.sh`는 하나의 `codex exec` 작업을 실행하고, 고유한 `--output-last-message` 파일을 통해 완료를 감지한 뒤, Codex가 끝난 후에도 남아 있을 수 있는 잔여 프로세스를 정리합니다.
-- `codex_monitor.py`는 `http://localhost:8787`에서 동작하는 표준 라이브러리만으로 구성된 웹 대시보드입니다. `ps`와 `~/.codex/sessions`를 읽어 실행 중인 작업, 최근 세션, 활동, 토큰, 디스패치 상태를 보여줍니다.
+- `codex_monitor.py`는 `http://localhost:8787`에서 동작하는 Python 표준 라이브러리만으로 구성된 웹 대시보드입니다. `ps`와 `~/.codex/sessions`를 읽어 실행 중인 작업, 최근 세션, 활동, 토큰, 비용, 디스패치 상태를 보여줍니다.
 - `codex-instructions`는 `CODEX_INSTRUCTIONS_FILE`을 통해 Codex가 지시 파일을 참조하도록 가리켜 주는 선택적 런처입니다.
 
 ## 대시보드
 
-`http://localhost:8787`에서 동작하는 표준 라이브러리만으로 구성된 웹 UI입니다 — 데이터베이스도, 의존성도 없습니다. 일정 간격으로 `ps`와 `~/.codex/sessions`를 폴링하여 위임된 모든 Codex 작업을 실시간으로 렌더링합니다. 위에서 아래로 각 섹션이 하는 일은 다음과 같습니다.
+`http://localhost:8787`에서 동작하는 Python 표준 라이브러리만으로 구성된 웹 UI입니다 — 데이터베이스도, Python 패키지 의존성도 없습니다. 브라우저는 Google Fonts를 외부에서 로드합니다. 모니터는 일정 간격으로 `ps`와 Codex 세션 디렉터리를 폴링하여 위임된 모든 Codex 작업을 실시간으로 렌더링합니다. 위에서 아래로 각 섹션이 하는 일은 다음과 같습니다.
 
 ### 매스헤드 & 통계
 
@@ -22,15 +24,29 @@ OpenAI Codex CLI를 위한 실시간 텔레메트리 + 디스패치 래퍼로, C
 
 매스헤드는 대시보드 정체성, 현재 날짜/시간, 새로고침 신선도를 보여줍니다. 방송 표시등은 적어도 하나의 작업이 실행 중일 때 **`ON AIR`**, 실행 중인 것이 없을 때 **`STANDBY`**로 표시됩니다.
 
-그 아래에는 한눈에 보이는 다섯 개의 타일이 있습니다:
+그 아래에는 한눈에 보는 통계 4개와 별도의 Codex 비용 패널이 있습니다:
 
-| 타일 | 의미 |
+| 통계 | 의미 |
 |------|---------|
-| **RUNNING** | 현재 감지된 실행 중인 `codex exec` 작업의 수. |
-| **TODAY** | 오늘 시작된 Codex 세션 수 (`~/.codex/sessions/YYYY/MM/DD/` 아래의 JSONL 파일). |
-| **RATE 5H** | 스캔된 최근 세션 전체에서 관측된 가장 높은 rate-limit 사용량(`primary.used_percent`), 백분율 + 게이지로 표시. |
-| **COST** | 설정된 토큰 가격을 사용해 계산한, 스캔된 총 토큰과 예상 비용. |
-| **WIRE LINES** | 현재 라이브 피드에 있는 이벤트 행의 수. |
+| **Live** | `ps`에서 감지한 현재 실행 중인 `codex exec` 작업 수. |
+| **Sessions today** | 오늘 시작된 Codex 세션 수 (`~/.codex/sessions/YYYY/MM/DD/`, 또는 설정된 세션 루트 아래의 JSONL 파일). |
+| **Rate** | 관측된 가장 높은 rate-limit 사용량을 백분율 + 게이지로 표시합니다. 인라인 토글로 **5h**(`primary`, 5시간 창)와 **7d**(`secondary`, 주간 창)를 전환합니다. 선택한 창은 `localStorage`에 기억됩니다. |
+| **Wire feed** | 최근 피드 창에서 활성 상태였던 세션을 기준으로, 현재 라이브 피드에 있는 이벤트 행의 수. |
+
+### Codex 비용 패널
+
+비용 패널은 상단 통계와 분리되어 있습니다. `token_count` 이벤트와 모니터에 고정된 가격표를 사용해 Codex 비용을 추정합니다: `gpt-5.5` 기준 **입력 토큰 $5.00 / 1M**, **캐시 입력 토큰 $0.50 / 1M**, **출력 토큰 $30.00 / 1M**입니다. 세션의 모델이 비어 있거나 알 수 없는 값이면 모니터는 `gpt-5.5` 가격으로 fallback합니다.
+
+패널 구성은 다음과 같습니다:
+
+| 컨트롤 / 보기 | 의미 |
+|----------------|---------|
+| **5H / Day / Wk / Mo / Yr** | 최근 5시간, 24시간, 7일, 30일, 12개월 비용 창을 전환하는 타임프레임 탭입니다. 선택한 타임프레임은 `localStorage`에 기억됩니다. |
+| **각진 area 그래프** | 선택한 타임프레임의 버킷별 비용을 smoothing 없이 표시하는 area 차트입니다. |
+| **가로 그리드** | 현재 피크 버킷 기준으로 동적으로 계산되는 "nice" 금액 그리드라인입니다. |
+| **시간축** | 선택한 창에 맞춘 세로 가이드와 시간 라벨입니다. 가능한 경우 `now`도 표시합니다. |
+| **hover 상세** | 마우스 hover 시 세로 가이드선, 점 마커, 버킷 시각과 금액이 있는 툴팁을 표시합니다. |
+| **`est` / `est:fallback`** | `est`는 토큰 사용량에서 계산한 추정값이라는 뜻입니다. `est:fallback`은 세션 모델을 알 수 없거나 지원하지 않아 fallback `gpt-5.5` 가격을 사용했다는 뜻입니다. |
 
 ### 컨트롤 & 알림
 
@@ -83,7 +99,7 @@ OpenAI Codex CLI를 위한 실시간 텔레메트리 + 디스패치 래퍼로, C
 - [Claude Code](https://claude.com/claude-code) — Codex에 작업을 위임하도록 의도된 드라이버 (`dispatch.sh`는 단독으로도 실행할 수 있습니다).
 - OpenAI Codex CLI 설치.
 - `codex login` 완료.
-- Python 3.
+- Python 3.7+ (`ThreadingHTTPServer`와 `subprocess.run(..., text=True)`를 사용합니다).
 
 ## 설치
 
@@ -92,6 +108,12 @@ git clone https://github.com/part3917/codex-wire.git codex-wire
 cd codex-wire
 ./install.sh
 ```
+
+`install.sh`가 하는 일:
+
+- 이 clone의 `dispatch.sh`를 `~/.codex/dispatch.sh`에 설치합니다(현재 동작은 심볼릭 링크).
+- `.env`가 없을 때만 `.env.example`에서 `.env`를 생성합니다. 기존 `.env`는 덮어쓰지 않습니다.
+- `examples/codex.md`의 `/codex` Claude Code 커맨드를 `~/.claude/commands/codex.md`에 설치합니다. 기존 파일이 있으면 덮어쓰지 않습니다.
 
 수동 설정:
 
@@ -120,7 +142,7 @@ cp .env.example .env
 모니터 실행:
 
 ```bash
-python3 codex_monitor.py
+python3 <clone-dir>/codex_monitor.py
 ```
 
 그런 다음 `http://localhost:8787`을 엽니다.
@@ -145,7 +167,10 @@ CODEX_INSTRUCTIONS_FILE=/path/to/your/AGENTS.md ./codex-instructions exec -C "$P
 
 - `CODEX_INSTRUCTIONS_FILE`: `codex-instructions`를 위한 선택적 지시 파일.
 - `CODEX_WIRE_OUTDIR`: 디스패치 요약과 로그의 출력 디렉터리.
-- `CODEX_MONITOR_*`: 대시보드 스캔 한도, stale 임계치, 토큰 비용 추정, 바인드 호스트/포트, 재시도 명령.
+- `CODEX_MONITOR_SESS_DIR`: Codex 세션 JSONL 루트 override. 기본값: `~/.codex/sessions`.
+- `CODEX_MONITOR_*`: 대시보드 스캔 한도, stale 임계치, 바인드 호스트/포트, 추적 파일, 재시도 명령, 세션 루트.
+
+비용 추정은 `codex_monitor.py`에 내장된 고정 가격표를 사용합니다. 토큰 가격은 `.env`로 설정하지 않습니다.
 
 ## 출처 표기
 

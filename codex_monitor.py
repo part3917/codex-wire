@@ -5,11 +5,11 @@ Sources (stdlib only, no deps):
   • `ps`                          → running codex exec jobs (pid, elapsed, cwd, sandbox)
   • ~/.codex/sessions/**/*.jsonl  → live activity: commands, file edits, agent messages, tokens
 """
-import argparse, ctypes, datetime, glob, hashlib, json, os, re, shlex, signal, struct, subprocess, sys, threading, time, urllib.parse
+import argparse, ctypes, datetime, glob, hashlib, json, math, os, re, shlex, signal, struct, subprocess, sys, threading, time, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8787
-SESS = os.path.expanduser("~/.codex/sessions")
+SESS = os.path.expanduser(os.environ.get("CODEX_MONITOR_SESS_DIR", "~/.codex/sessions"))
 HOME = os.path.expanduser("~")
 
 SESSION_LIMIT = int(os.environ.get("CODEX_MONITOR_SESSION_LIMIT", "80"))
@@ -27,6 +27,8 @@ PRICING = {
 }
 
 _TRACK_STATE = None
+_PS_STATE = {"jobs": [], "degraded": False, "error": "", "ts": 0.0}
+_LAST_SNAPSHOT = None
 
 
 def _short(p):
@@ -35,10 +37,14 @@ def _short(p):
 
 def _ps_lines():
     try:
-        return subprocess.run(["ps", "-axww", "-o", "pid=,etime=,stat=,args="],
-                              capture_output=True, text=True, timeout=4).stdout.splitlines()
-    except Exception:
-        return []
+        proc = subprocess.run(["ps", "-axww", "-o", "pid=,etime=,stat=,args="],
+                              capture_output=True, text=True, timeout=4)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or "").strip() or f"ps exited {proc.returncode}")
+        return proc.stdout.splitlines()
+    except Exception as e:
+        _PS_STATE.update(degraded=True, error=str(e), ts=time.time())
+        return None
 
 
 def _is_monitor_server(pid, args):
@@ -211,9 +217,15 @@ def _normalize_out(path, cwd=None):
     return os.path.abspath(out)
 
 
-def running_jobs():
+def running_jobs(use_cache_on_failure=True):
     jobs, seen = [], set()
-    for ln in _ps_lines():
+    lines = _ps_lines()
+    if lines is None:
+        if use_cache_on_failure:
+            return [dict(j, ps_degraded=True) for j in (_PS_STATE.get("jobs") or [])]
+        return []
+    _PS_STATE.update(degraded=False, error="", ts=time.time())
+    for ln in lines:
         try:
             pid, etime, stat, args = ln.strip().split(None, 3)
         except ValueError:
@@ -241,6 +253,7 @@ def running_jobs():
         seen.add(key)
         jobs.append({"pid": pid, "elapsed": etime, "cwd": _short(cwd), "cwd_raw": cwd,
                      "sandbox": sandbox, "out": out, "plabel": plabel, "alive": _pid_alive(pid)})
+    _PS_STATE["jobs"] = [dict(j) for j in jobs]
     return jobs
 
 
@@ -257,6 +270,33 @@ _LONG_CMD_RE = re.compile(
 )
 
 
+def _add_parse_error(parse_errors, msg):
+    if parse_errors is not None and len(parse_errors) < 3:
+        parse_errors.append(str(msg))
+
+
+def _jsonl_obj(raw, parse_errors=None, complete=None):
+    if not raw or not raw.strip():
+        return None
+    if complete is None:
+        complete = raw.endswith(b"\n")
+    try:
+        obj = json.loads(raw.strip())
+    except Exception as e:
+        if not complete:
+            return None
+        _add_parse_error(parse_errors, e)
+        return None
+    if not isinstance(obj, dict):
+        _add_parse_error(parse_errors, "jsonl schema: top-level record is not an object")
+        return None
+    payload = obj.get("payload", {})
+    if payload is not None and not isinstance(payload, dict):
+        _add_parse_error(parse_errors, "jsonl schema: payload is not an object")
+        return None
+    return obj
+
+
 def _iter(path, size=None, parse_errors=None):
     """Yield json objects from a jsonl. For very large files, read only the
     head (session meta / prompt) + tail (recent events) so a huge rollout
@@ -268,29 +308,20 @@ def _iter(path, size=None, parse_errors=None):
             if size > _BIG:
                 fh.seek(0)
                 for raw in fh.read(_HEAD).split(b"\n")[:-1]:
-                    try:
-                        if raw.strip():
-                            yield json.loads(raw)
-                    except Exception as e:
-                        if parse_errors is not None and len(parse_errors) < 3:
-                            parse_errors.append(str(e))
+                    obj = _jsonl_obj(raw, parse_errors, complete=True)
+                    if obj is not None:
+                        yield obj
                 fh.seek(size - _TAIL); fh.readline()   # drop the partial first line
                 for raw in fh:
-                    try:
-                        if raw.strip():
-                            yield json.loads(raw)
-                    except Exception as e:
-                        if parse_errors is not None and len(parse_errors) < 3:
-                            parse_errors.append(str(e))
+                    obj = _jsonl_obj(raw, parse_errors)
+                    if obj is not None:
+                        yield obj
             else:
                 fh.seek(0)
                 for raw in fh:
-                    try:
-                        if raw.strip():
-                            yield json.loads(raw)
-                    except Exception as e:
-                        if parse_errors is not None and len(parse_errors) < 3:
-                            parse_errors.append(str(e))
+                    obj = _jsonl_obj(raw, parse_errors)
+                    if obj is not None:
+                        yield obj
     except Exception:
         return
 
@@ -360,7 +391,16 @@ def _usage_cost(tokens, pricing):
     cost = (uncached * pricing["input"] +
             tokens.get("cached", 0) * pricing["cached"] +
             tokens.get("output", 0) * pricing["output"]) / 1_000_000
-    return round(cost, 4)
+    return float(cost)
+
+
+def _api_tokens(tokens):
+    out = dict(tokens or {})
+    try:
+        out["cost"] = round(float(out.get("cost") or 0.0), 4)
+    except Exception:
+        out["cost"] = 0.0
+    return out
 
 
 def _normalize_usage(info, model=None):
@@ -436,79 +476,87 @@ def parse_session(path):
          "tokens": {"input": 0, "cached": 0, "output": 0, "reasoning": 0, "total": 0, "cost": 0.0}}
     files, exec_calls, parse_errors = set(), {}, []
     for o in _iter(path, st.st_size, parse_errors):
-        ts = o.get("timestamp", "")
-        ets = _epoch(ts)
-        if ets:
-            s["last_ts"] = max(s["last_ts"], ets)
-            if s["last_event_epoch"] is None or ets > s["last_event_epoch"]:
-                s["last_event_epoch"] = ets
-                s["last_event_ts"] = ts
-        p = o.get("payload", {}) or {}
-        otype, ptype = o.get("type"), p.get("type", "")
-        if otype == "session_meta" or ("cwd" in p and not s["cwd"]):
-            s["cwd"] = p.get("cwd", s["cwd"]); s["model"] = (p.get("model") or o.get("model") or s["model"])
-        elif ptype == "task_started":
-            s["started"] = p.get("started_at"); s["ctx_window"] = p.get("model_context_window")
-        elif ptype == "user_message":
-            s["prompt"] = (p.get("message") or "")[:5000]
-        elif ptype == "agent_message":
-            m = (p.get("message") or "").strip()
-            if m:
-                s["last_msg"] = m
-                _event(s["events"], ts, "msg", m, True)
-        elif ptype == "function_call" and p.get("name") == "exec_command":
-            try:
-                args = json.loads(p.get("arguments", "{}"))
-                cmd = args.get("cmd", "")
-            except Exception:
-                cmd = p.get("arguments", "")
-            cmd = re.sub(r"\s+", " ", str(cmd)).strip()
-            if cmd:
-                s["n_cmds"] += 1; s["last_cmd"] = cmd
-                if p.get("call_id"):
-                    exec_calls[p.get("call_id")] = {"cmd": cmd, "ts": ts, "epoch": ets}
-                _event(s["events"], ts, "cmd", cmd[:240], False)
-        elif ptype == "function_call_output":
-            out = str(p.get("output", ""))
-            call_id = p.get("call_id")
-            call = exec_calls.pop(call_id, None) if call_id else None
-            if call or out.startswith("Chunk ID:"):
-                code = _exit_code(out)
-                cmd = (call or {}).get("cmd") if isinstance(call, dict) else (call or s["last_cmd"])
-                entry = {"ts": ts, "cmd": cmd, "exit_code": code, "output": _trim_output(out)}
-                s["outputs"].append(entry)
-                if code not in (None, 0):
-                    err = _error_entry(ts, entry["cmd"], code, entry["output"])
+        try:
+            if not isinstance(o, dict):
+                continue
+            p = o.get("payload", {}) or {}
+            if not isinstance(p, dict):
+                _add_parse_error(parse_errors, "jsonl schema: payload is not an object")
+                continue
+            ts = o.get("timestamp", "")
+            ets = _epoch(ts)
+            if ets:
+                s["last_ts"] = max(s["last_ts"], ets)
+                if s["last_event_epoch"] is None or ets > s["last_event_epoch"]:
+                    s["last_event_epoch"] = ets
+                    s["last_event_ts"] = ts
+            otype, ptype = o.get("type"), p.get("type", "")
+            if otype == "session_meta" or ("cwd" in p and not s["cwd"]):
+                s["cwd"] = p.get("cwd", s["cwd"]); s["model"] = (p.get("model") or o.get("model") or s["model"])
+            elif ptype == "task_started":
+                s["started"] = p.get("started_at"); s["ctx_window"] = p.get("model_context_window")
+            elif ptype == "user_message":
+                s["prompt"] = (p.get("message") or "")[:5000]
+            elif ptype == "agent_message":
+                m = (p.get("message") or "").strip()
+                if m:
+                    s["last_msg"] = m
+                    _event(s["events"], ts, "msg", m, True)
+            elif ptype == "function_call" and p.get("name") == "exec_command":
+                try:
+                    args = json.loads(p.get("arguments", "{}"))
+                    cmd = args.get("cmd", "")
+                except Exception:
+                    cmd = p.get("arguments", "")
+                cmd = re.sub(r"\s+", " ", str(cmd)).strip()
+                if cmd:
+                    s["n_cmds"] += 1; s["last_cmd"] = cmd
+                    if p.get("call_id"):
+                        exec_calls[p.get("call_id")] = {"cmd": cmd, "ts": ts, "epoch": ets}
+                    _event(s["events"], ts, "cmd", cmd[:240], False)
+            elif ptype == "function_call_output":
+                out = str(p.get("output", ""))
+                call_id = p.get("call_id")
+                call = exec_calls.pop(call_id, None) if call_id else None
+                if call or out.startswith("Chunk ID:"):
+                    code = _exit_code(out)
+                    cmd = (call or {}).get("cmd") if isinstance(call, dict) else (call or s["last_cmd"])
+                    entry = {"ts": ts, "cmd": cmd, "exit_code": code, "output": _trim_output(out)}
+                    s["outputs"].append(entry)
+                    if code not in (None, 0):
+                        err = _error_entry(ts, entry["cmd"], code, entry["output"])
+                        s["errors"].append(err)
+                        _event(s["events"], ts, "err", f"{err['label']}: {entry['cmd']}", True)
+                    else:
+                        _event(s["events"], ts, "out", entry["cmd"], False)
+            elif ptype == "custom_tool_call" and p.get("name") == "apply_patch":
+                s["n_edits"] += 1
+                _event(s["events"], ts, "edit", "apply_patch", True)
+            elif ptype == "custom_tool_call_output":
+                output = str(p.get("output", ""))
+                for m in re.finditer(r"[AM]\s+(\S+)", output):
+                    files.add(os.path.basename(m.group(1)))
+                if "error" in output.lower() or "failed" in output.lower():
+                    err = _error_entry(ts, "apply_patch", None, output)
                     s["errors"].append(err)
-                    _event(s["events"], ts, "err", f"{err['label']}: {entry['cmd']}", True)
-                else:
-                    _event(s["events"], ts, "out", entry["cmd"], False)
-        elif ptype == "custom_tool_call" and p.get("name") == "apply_patch":
-            s["n_edits"] += 1
-            _event(s["events"], ts, "edit", "apply_patch", True)
-        elif ptype == "custom_tool_call_output":
-            output = str(p.get("output", ""))
-            for m in re.finditer(r"[AM]\s+(\S+)", output):
-                files.add(os.path.basename(m.group(1)))
-            if "error" in output.lower() or "failed" in output.lower():
-                err = _error_entry(ts, "apply_patch", None, output)
-                s["errors"].append(err)
-                _event(s["events"], ts, "err", f"{err['label']}: apply_patch", True)
-        elif ptype == "token_count":
-            rate_limits = p.get("rate_limits") or {}
-            primary = _rate_sample(rate_limits.get("primary") or {}, ts, ets)
-            if primary is not None:
-                s["rate_primary"] = primary
-                s["rate_pct"] = primary["pct"]
-            secondary = _rate_sample(rate_limits.get("secondary") or {}, ts, ets)
-            if secondary is not None:
-                s["rate_secondary"] = secondary
-            info = p.get("info") or {}
-            if info:
-                s["model"] = (p.get("model") or info.get("model") or info.get("model_name") or s.get("model") or DEFAULT_MODEL)
-                s["tokens"] = _normalize_usage(info, s["model"])
-                if info.get("model_context_window"):
-                    s["ctx_window"] = info.get("model_context_window")
+                    _event(s["events"], ts, "err", f"{err['label']}: apply_patch", True)
+            elif ptype == "token_count":
+                rate_limits = p.get("rate_limits") or {}
+                primary = _rate_sample(rate_limits.get("primary") or {}, ts, ets)
+                if primary is not None:
+                    s["rate_primary"] = primary
+                    s["rate_pct"] = primary["pct"]
+                secondary = _rate_sample(rate_limits.get("secondary") or {}, ts, ets)
+                if secondary is not None:
+                    s["rate_secondary"] = secondary
+                info = p.get("info") or {}
+                if info:
+                    s["model"] = (p.get("model") or info.get("model") or info.get("model_name") or s.get("model") or DEFAULT_MODEL)
+                    s["tokens"] = _normalize_usage(info, s["model"])
+                    if info.get("model_context_window"):
+                        s["ctx_window"] = info.get("model_context_window")
+        except Exception as e:
+            _add_parse_error(parse_errors, f"jsonl schema: {e}")
     if parse_errors:
         err = _error_entry("", "jsonl parser", None, "JSONL parse damage: " + "; ".join(parse_errors))
         s["errors"].append(err)
@@ -789,7 +837,7 @@ def _mark_dashboard_kill(pid, out, job=None):
 
 def _job_payload(j, s, now):
     status, age_sec, activity = _status_for_session(s, True, j.get("alive", True), now)
-    tokens = (s or {}).get("tokens", {})
+    tokens = _api_tokens((s or {}).get("tokens", {}))
     return {
         "key": _session_key(s) if s else f"pid-{j['pid']}",
         "pid": j["pid"], "elapsed": j["elapsed"], "cwd": j["cwd"], "cwd_raw": j["cwd_raw"],
@@ -813,7 +861,7 @@ def _job_payload(j, s, now):
 # ── Cost history ─────────────────────────────────────────────────────────────
 # Cost graph points are derived from token_count cumulative deltas. This parser
 # intentionally does not use _iter(): large files must not skip middle deltas.
-_COST_INDEX_PATH = os.path.expanduser("~/.codex/codex_wire_cost_index.json")
+_COST_INDEX_PATH = os.path.expanduser(os.environ.get("CODEX_MONITOR_COST_INDEX_PATH", "~/.codex/codex_wire_cost_index.json"))
 _COST_INDEX_SCHEMA = 1
 _COST_INDEX = None
 _COST_INDEX_LOCK = threading.Lock()
@@ -845,6 +893,65 @@ def _empty_cost_index():
     }
 
 
+def _coerce_int(v):
+    if isinstance(v, bool):
+        raise ValueError("bool is not an int")
+    return int(v)
+
+
+def _coerce_float(v):
+    if isinstance(v, bool):
+        raise ValueError("bool is not a float")
+    out = float(v)
+    if not math.isfinite(out):
+        raise ValueError("non-finite float")
+    return out
+
+
+def _coerce_usage_record(value):
+    if not isinstance(value, dict):
+        raise ValueError("last_usage is not an object")
+    out = {}
+    for k in ("input", "cached", "output", "total"):
+        out[k] = max(0, _coerce_int(value.get(k, 0)))
+    if not out["total"]:
+        out["total"] = out["input"] + out["output"]
+    return out
+
+
+def _coerce_cost_points(points):
+    if not isinstance(points, list):
+        raise ValueError("points is not a list")
+    out = []
+    for pt in points:
+        if not isinstance(pt, dict):
+            continue
+        try:
+            ts = _coerce_float(pt.get("ts"))
+            cost = _coerce_float(pt.get("cost"))
+            total = _coerce_int(pt.get("total"))
+        except Exception:
+            continue
+        out.append({"ts": ts, "cost": cost, "total": max(0, total)})
+    return out
+
+
+def _coerce_cost_record(rec):
+    if not isinstance(rec, dict):
+        raise ValueError("record is not an object")
+    return {
+        "dev": _coerce_int(rec.get("dev")),
+        "ino": _coerce_int(rec.get("ino")),
+        "size": max(0, _coerce_int(rec.get("size"))),
+        "mtime": _coerce_float(rec.get("mtime", 0.0)),
+        "offset": max(0, _coerce_int(rec.get("offset", 0))),
+        "last_usage": _coerce_usage_record(rec.get("last_usage")),
+        "last_model": str(rec.get("last_model") or DEFAULT_MODEL),
+        "last_ts": str(rec.get("last_ts") or ""),
+        "points": _coerce_cost_points(rec.get("points", [])),
+    }
+
+
 def _load_cost_index():
     global _COST_INDEX
     if _COST_INDEX is not None:
@@ -860,8 +967,23 @@ def _load_cost_index():
             data.get("pricing_version") != _pricing_version() or
             not isinstance(data.get("files"), dict)):
         data = _empty_cost_index()
-    data.setdefault("generation", 0)
-    data.setdefault("files", {})
+    try:
+        data["generation"] = max(0, _coerce_int(data.get("generation", 0)))
+    except Exception:
+        data["generation"] = 0
+    try:
+        data["updated_at"] = max(0.0, _coerce_float(data.get("updated_at", 0.0)))
+    except Exception:
+        data["updated_at"] = 0
+    files = {}
+    for path, rec in (data.get("files") or {}).items():
+        if not isinstance(path, str) or not path:
+            continue
+        try:
+            files[path] = _coerce_cost_record(rec)
+        except Exception:
+            continue
+    data["files"] = files
     data["pricing_version"] = _pricing_version()
     _COST_INDEX = data
     return _COST_INDEX
@@ -869,10 +991,14 @@ def _load_cost_index():
 
 def _save_cost_index(index):
     try:
-        os.makedirs(os.path.dirname(_COST_INDEX_PATH), exist_ok=True)
+        parent = os.path.dirname(_COST_INDEX_PATH)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         tmp = _COST_INDEX_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(index, fh, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, _COST_INDEX_PATH)
         return True
     except Exception:
@@ -908,7 +1034,7 @@ def _cost_usage_from_info(info):
 def _usage_decreased(cur, prev):
     if not prev:
         return False
-    return any(int(cur.get(k, 0)) < int(prev.get(k, 0)) for k in ("input", "cached", "output", "total"))
+    return int(cur.get("total", 0)) < int(prev.get("total", 0))
 
 
 def _usage_delta(cur, prev):
@@ -956,7 +1082,19 @@ def _cost_file_record(path, st, old=None, reset=False):
 
                 parsed_any = True
                 offset = next_pos
+                if not isinstance(obj, dict):
+                    parse_errors.append("jsonl schema: top-level record is not an object")
+                    if len(parse_errors) >= 3:
+                        severe = True
+                        break
+                    continue
                 payload = obj.get("payload", {}) or {}
+                if not isinstance(payload, dict):
+                    parse_errors.append("jsonl schema: payload is not an object")
+                    if len(parse_errors) >= 3:
+                        severe = True
+                        break
+                    continue
                 model = payload.get("model") or obj.get("model") or last_model
                 if model:
                     last_model = str(model)
@@ -1187,6 +1325,11 @@ def _cost_blabels(name, now):
 
 def cost_series(now):
     """Bucket token_count delta spend into rolling windows."""
+    pricing_version = _pricing_version()
+    if (_SERIES_CACHE["data"] is not None and (now - _SERIES_CACHE["ts"]) < 15 and
+            _SERIES_CACHE.get("pricing_version") == pricing_version):
+        return _SERIES_CACHE["data"]
+
     try:
         files = sorted(glob.glob(os.path.join(SESS, "**", "*.jsonl"), recursive=True))
     except Exception:
@@ -1199,12 +1342,6 @@ def cost_series(now):
             continue
         entries.append((f, st))
         sig.append(_file_sig(f, st))
-
-    pricing_version = _pricing_version()
-    if (_SERIES_CACHE["data"] is not None and (now - _SERIES_CACHE["ts"]) < 15 and
-            _SERIES_CACHE.get("sig") == sig and
-            _SERIES_CACHE.get("pricing_version") == pricing_version):
-        return _SERIES_CACHE["data"]
 
     pts, generation, _ = _refresh_cost_index(entries)
     if (_SERIES_CACHE["data"] is not None and (now - _SERIES_CACHE["ts"]) < 15 and
@@ -1290,8 +1427,8 @@ def snapshot():
             "cwd": _short(s["cwd"]).split("/")[-1] or "session", "cwd_raw": s["cwd"],
             "prompt": (s["prompt"] or s["last_msg"] or "(session)")[:500],
             "n_cmds": s["n_cmds"], "n_edits": s["n_edits"], "files": s["files"][:4],
-            "rate_pct": s["rate_pct"], "tokens": s["tokens"], "token_total": s["tokens"].get("total", 0),
-            "cost": s["tokens"].get("cost", 0.0), "cost_estimate": s["tokens"].get("cost_estimate", False),
+            "rate_pct": s["rate_pct"], "tokens": _api_tokens(s["tokens"]), "token_total": s["tokens"].get("total", 0),
+            "cost": round(float(s["tokens"].get("cost", 0.0) or 0.0), 4), "cost_estimate": s["tokens"].get("cost_estimate", False),
             "cost_note": s["tokens"].get("cost_note", ""), "errors": s["errors"][:2],
         })
     recent = recent[:RECENT_LIMIT]
@@ -1318,6 +1455,7 @@ def snapshot():
             "token_total": token_total, "cost_total": cost_total, "cost_estimate": cost_estimate,
             "token_total_recent": token_total_recent, "cost_total_recent": cost_total_recent,
             "cost_series": cost_series(now),
+            "source_degraded": {"ps": bool(_PS_STATE.get("degraded")), "ps_error": _PS_STATE.get("error", "")},
             "running": running, "feed": feed, "recent": recent}
 
 
@@ -1340,7 +1478,7 @@ def _local_client(handler):
 
 
 def _find_running_job(pid=None, out=None):
-    for j in running_jobs():
+    for j in running_jobs(use_cache_on_failure=False):
         if pid and str(j.get("pid")) == str(pid):
             return j
         if out and j.get("out") == out:
@@ -2182,8 +2320,20 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body))); self.end_headers()
         self.wfile.write(body)
     def do_GET(self):
+        global _LAST_SNAPSHOT
         if self.path.startswith("/api"):
-            body = json.dumps(snapshot(), ensure_ascii=False).encode()
+            try:
+                data = snapshot()
+                _LAST_SNAPSHOT = data
+            except Exception as e:
+                if _LAST_SNAPSHOT is not None:
+                    data = dict(_LAST_SNAPSHOT)
+                    data["degraded"] = True
+                    data["api_error"] = str(e)
+                else:
+                    data = {"ok": False, "degraded": True, "api_error": str(e),
+                            "ts": time.strftime("%H:%M:%S")}
+            body = json.dumps(data, ensure_ascii=False).encode()
             self._send(200, body, "application/json; charset=utf-8")
         else:
             self._send(200, PAGE.encode(), "text/html; charset=utf-8")
