@@ -1090,25 +1090,63 @@ def _year_buckets(pts, now):
     return cost, toks
 
 
+def _aligned_starts(now, unit, n):
+    """Bucket starts aligned to clock boundaries, oldest to newest."""
+    if unit == 86400:
+        anchor = datetime.datetime.fromtimestamp(now).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).timestamp()
+    else:
+        anchor = (now // unit) * unit
+    return [anchor - (n - 1 - k) * unit for k in range(n)]
+
+
+def _cost_grid(name, now):
+    ranges = {
+        "5h": (600, 30),
+        "day": (3600, 24),
+        "week": (86400, 7),
+        "month": (86400, 30),
+    }
+    spec = ranges.get(name)
+    if not spec:
+        return None
+    unit, n = spec
+    return unit, n, _aligned_starts(now, unit, n)
+
+
 def _cost_axis(name, now):
     """Time anchors for a range's x-axis: normalized x (0=oldest, 1=now) + label."""
     base = datetime.datetime.fromtimestamp(now)
-    td = datetime.timedelta
+    grid = _cost_grid(name, now)
     if name == "5h":
-        return [{"x": round(1 - h / 5, 4), "label": "now" if h == 0 else f"-{h}h"} for h in (5, 4, 3, 2, 1, 0)]
-    if name == "day":
+        _, n, starts = grid
         out = []
-        for h in range(24, -1, -2):
-            t = base - td(hours=h)
-            out.append({"x": round(1 - h / 24, 4), "label": "now" if h == 0 else t.strftime("%H:%M")})
+        for k, ts in enumerate(starts[:-1]):
+            t = datetime.datetime.fromtimestamp(ts)
+            if t.minute == 0:
+                out.append({"x": round(k / (n - 1), 4), "label": t.strftime("%H:%M")})
+        out.append({"x": 1, "label": "now"})
+        return out
+    if name == "day":
+        _, n, starts = grid
+        out = [{"x": round(k / (n - 1), 4),
+                "label": datetime.datetime.fromtimestamp(starts[k]).strftime("%H:%M")}
+               for k in range(0, n, 2)]
+        out.append({"x": 1, "label": "now"})
         return out
     if name == "week":
-        return [{"x": round((i + 0.5) / 7, 4), "label": (base - td(days=6 - i)).strftime("%a")} for i in range(7)]
+        _, n, starts = grid
+        return [{"x": round(k / (n - 1), 4),
+                 "label": datetime.datetime.fromtimestamp(starts[k]).strftime("%a")}
+                for k in range(n)]
     if name == "month":
+        _, n, starts = grid
         out = []
-        for d in (30, 20, 10, 0):
-            t = base - td(days=d)
-            out.append({"x": round(1 - d / 30, 4), "label": "now" if d == 0 else f"{t.month}/{t.day}"})
+        for k in (0, 10, 20):
+            t = datetime.datetime.fromtimestamp(starts[k])
+            out.append({"x": round(k / (n - 1), 4), "label": f"{t.month}/{t.day}"})
+        out.append({"x": 1, "label": "now"})
         return out
     if name == "year":
         seq, y, m = [], base.year, base.month
@@ -1117,8 +1155,33 @@ def _cost_axis(name, now):
             if m == 0:
                 m, y = 12, y - 1
         seq.reverse()
-        return [{"x": round((i + 0.5) / 12, 4), "label": datetime.date(yy, mm, 1).strftime("%b")}
+        return [{"x": round(i / 11, 4), "label": datetime.date(yy, mm, 1).strftime("%b")}
                 for i, (yy, mm) in enumerate(seq)]
+    return []
+
+
+def _cost_blabels(name, now):
+    """Per-bucket hover labels for cost ranges, aligned to bucket starts."""
+    grid = _cost_grid(name, now)
+    if name == "5h":
+        return [datetime.datetime.fromtimestamp(ts).strftime("%H:%M") for ts in grid[2]]
+    if name == "day":
+        return [datetime.datetime.fromtimestamp(ts).strftime("%H:%M") for ts in grid[2]]
+    if name == "week":
+        return [f"{dt.strftime('%a')} {dt.month}/{dt.day}"
+                for dt in (datetime.datetime.fromtimestamp(ts) for ts in grid[2])]
+    if name == "month":
+        return [f"{dt.month}/{dt.day}"
+                for dt in (datetime.datetime.fromtimestamp(ts) for ts in grid[2])]
+    if name == "year":
+        base = datetime.datetime.fromtimestamp(now)
+        seq, y, m = [], base.year, base.month
+        for _ in range(12):
+            seq.append((y, m)); m -= 1
+            if m == 0:
+                m, y = 12, y - 1
+        seq.reverse()
+        return [datetime.date(yy, mm, 1).strftime("%b") for yy, mm in seq]
     return []
 
 
@@ -1151,21 +1214,23 @@ def cost_series(now):
         return _SERIES_CACHE["data"]
 
     out = {}
-    for name, span, nb in _COST_RANGES:
-        start, width = now - span, span / nb
+    for name, _, _ in _COST_RANGES:
+        unit, nb, starts = _cost_grid(name, now)
         cost, toks = [0.0] * nb, 0
         for pt in pts:
-            if pt["ts"] < start or pt["ts"] > now:
+            if pt["ts"] < starts[0] or pt["ts"] > now:
                 continue
-            i = int((pt["ts"] - start) / width)
-            i = 0 if i < 0 else (nb - 1 if i >= nb else i)
-            cost[i] += pt["cost"]
-            toks += pt["total"]
+            i = int((pt["ts"] - starts[0]) // unit)
+            if 0 <= i < nb:
+                cost[i] += pt["cost"]
+                toks += pt["total"]
         out[name] = {"label": _COST_LABEL[name], "points": [round(c, 4) for c in cost],
-                     "total": round(sum(cost), 4), "tokens": toks, "axis": _cost_axis(name, now)}
+                     "total": round(sum(cost), 4), "tokens": toks, "axis": _cost_axis(name, now),
+                     "blabels": _cost_blabels(name, now)}
     ycost, ytok = _year_buckets(pts, now)
     out["year"] = {"label": _COST_LABEL["year"], "points": [round(c, 4) for c in ycost],
-                   "total": round(sum(ycost), 4), "tokens": ytok, "axis": _cost_axis("year", now)}
+                   "total": round(sum(ycost), 4), "tokens": ytok, "axis": _cost_axis("year", now),
+                   "blabels": _cost_blabels("year", now)}
     _SERIES_CACHE["ts"] = now
     _SERIES_CACHE["data"] = out
     _SERIES_CACHE["sig"] = sig
@@ -1391,6 +1456,15 @@ body{
 .costbase{stroke:#cbb588;stroke-width:1;stroke-dasharray:2 5;vector-effect:non-scaling-stroke;opacity:.6}
 .costguide{stroke:#b79b6a;stroke-width:1;vector-effect:non-scaling-stroke;opacity:.26}
 .costguide.now{stroke:var(--ember2);opacity:.5;stroke-dasharray:2.5 2.5}
+.costhover{stroke:var(--ember2);stroke-width:1;vector-effect:non-scaling-stroke;opacity:.65;pointer-events:none}
+.costdot{position:absolute;width:8px;height:8px;border-radius:50%;background:var(--ember);
+  border:1px solid #fff0d0;box-shadow:0 0 0 2px rgba(207,89,21,.18),0 2px 8px rgba(42,29,16,.24);
+  transform:translate(-50%,-50%);z-index:4;pointer-events:none;display:none}
+.costtip{position:absolute;min-width:72px;padding:6px 8px;border:1px solid rgba(255,232,184,.28);
+  background:#261d14;color:#f5ead4;box-shadow:0 8px 18px rgba(42,29,16,.28);
+  font:10px/1.35 "JetBrains Mono",monospace;letter-spacing:.01em;z-index:5;pointer-events:none;display:none}
+.costtip b{display:block;color:#fff5dd;font-weight:600}
+.costtip span{display:block;color:#e99a55}
 .costaxis{position:absolute;left:0;right:0;bottom:4px;height:13px;z-index:2;pointer-events:none}
 .costaxis span{position:absolute;transform:translateX(-50%);font:9px "Saira Condensed",sans-serif;
   letter-spacing:.1em;text-transform:uppercase;color:var(--faint);white-space:nowrap}
@@ -1579,7 +1653,10 @@ footer{margin-top:40px;color:var(--faint);font-size:10.5px;border-top:1px solid 
     <g id=costguides></g>
     <path id=costarea class=costarea d=""/>
     <path id=costline class=costline d="" vector-effect=non-scaling-stroke pathLength="1"/>
+    <line id=costhover class=costhover x1="0" y1="0" x2="0" y2="100" visibility=hidden/>
   </svg>
+  <div class=costdot id=costdot></div>
+  <div class=costtip id=costtip></div>
   <div class=costaxis id=costaxis></div>
   <div class=costgridlab id=costgridlab></div>
   <div class=costface>
@@ -1673,6 +1750,7 @@ function setRateWin(w){
 const COST_LABEL={'5h':'5h session','day':'last 24h','week':'last 7 days','month':'last 30 days','year':'last 12 months'};
 let costRange='5h';
 try{const cr=localStorage.getItem('codex-wire-cost-range'); if(cr&&COST_LABEL[cr])costRange=cr;}catch(e){}
+let _costHover={points:[],peak:1,blabels:[]};
 // Sharp (no smoothing) area path in a 0..100 viewBox; non-scaling stroke keeps
 // the line crisp while the area stretches to the panel.
 function costPath(points){
@@ -1701,6 +1779,7 @@ function renderCost(d){
   const peak=pts.length?Math.max.apply(null,pts):0;
   setText(document.getElementById('cost_peak'),'$'+Number(peak).toFixed(2));
   setText(document.getElementById('cost_estflag'),d.cost_estimate?' · est':'');
+  _costHover={points:pts,peak:(pts.length?Math.max.apply(null,pts.concat(0)):0)||1,blabels:r.blabels||[]};
   const p=costPath(pts);
   const lEl=document.getElementById('costline'),aEl=document.getElementById('costarea');
   if(lEl)lEl.setAttribute('d',p.line);
@@ -1711,12 +1790,28 @@ function renderCost(d){
 // horizontal cost gridlines at "nice" values below the peak (same y-map as costPath)
 function costGrid(peak){
   if(!(peak>0))return [];
-  const rough=peak/3, mag=Math.pow(10,Math.floor(Math.log10(rough)))||1, norm=rough/mag;
-  const step=(norm>=5?5:norm>=2?2:1)*mag, out=[];
+  const limit=peak*0.98;
+  const mag=Math.pow(10,Math.floor(Math.log10(peak)))||1;
+  const mult=[0.1,0.2,0.25,0.5,1,2,2.5,5,10];
+  for(const m of mult){
+    const step=m*mag;
+    const n=Math.floor(limit/step);
+    if(n>=2 && n<=5){
+      const out=[];
+      for(let v=step; v<limit && out.length<5; v+=step)out.push(v);
+      return out;
+    }
+  }
+  const rough=peak/3, fmag=Math.pow(10,Math.floor(Math.log10(rough)))||1, norm=rough/fmag;
+  const step=(norm>=5?5:norm>=2?2:1)*fmag, out=[];
   for(let v=step; v<peak*0.94 && out.length<4; v+=step)out.push(v);
   return out;
 }
-function fmtCostShort(v){return v>=10?String(Math.round(v)):v>=1?v.toFixed(1):v.toFixed(2);}
+function fmtCostShort(v){
+  const one=Math.round(v*10)/10;
+  if(v>=1)return Math.abs(one-Math.round(one))<0.001?String(Math.round(one)):one.toFixed(1);
+  return v.toFixed(2);
+}
 function renderCostGrid(peak){
   const g=document.getElementById('costgridh'),lab=document.getElementById('costgridlab');
   const vals=costGrid(peak),H=100,top=14;
@@ -1734,12 +1829,42 @@ function renderCostAxis(axis){
     else style='left:'+(a.x*100).toFixed(2)+'%';
     return `<span class="${now?'now':''}" style="${style}">${esc(a.label)}</span>`;}).join('');
 }
+function hideCostHover(){
+  const h=document.getElementById('costhover'),dot=document.getElementById('costdot'),tip=document.getElementById('costtip');
+  if(h)h.setAttribute('visibility','hidden');
+  if(dot)dot.style.display='none';
+  if(tip)tip.style.display='none';
+}
+function moveCostHover(e){
+  const wrap=document.getElementById('costwrap'),data=_costHover||{},pts=data.points||[];
+  if(!wrap||!pts.length)return hideCostHover();
+  const rect=wrap.getBoundingClientRect();
+  if(!rect.width||!rect.height)return hideCostHover();
+  const fx=Math.min(1,Math.max(0,(e.clientX-rect.left)/rect.width));
+  const n=pts.length, i=Math.min(n-1,Math.max(0,Math.round(fx*(n-1))));
+  const x=n>1?i/(n-1)*100:50,H=100,top=14,peak=data.peak||1;
+  const y=H-(Math.max(0,Number(pts[i])||0)/peak)*(H-top);
+  const h=document.getElementById('costhover'),dot=document.getElementById('costdot'),tip=document.getElementById('costtip');
+  if(h){h.setAttribute('x1',x.toFixed(2));h.setAttribute('x2',x.toFixed(2));h.setAttribute('visibility','visible');}
+  if(dot){dot.style.left=x.toFixed(2)+'%';dot.style.top=y.toFixed(2)+'%';dot.style.display='block';}
+  if(tip){
+    tip.innerHTML=`<b>${esc((data.blabels||[])[i]||'')}</b><span>$${Number(pts[i]||0).toFixed(2)}</span>`;
+    tip.style.display='block';
+    const tw=tip.offsetWidth||80, th=tip.offsetHeight||38, pad=8;
+    const px=x/100*rect.width, py=y/100*rect.height;
+    const left=Math.min(rect.width-tw-pad,Math.max(pad,px-tw/2));
+    const above=py-th-12, topPx=above>=pad?above:Math.min(rect.height-th-pad,py+12);
+    tip.style.left=left+'px';
+    tip.style.top=Math.max(pad,topPx)+'px';
+  }
+}
 function setCostRange(range){
   if(!COST_LABEL[range])return;
   costRange=range;
   try{localStorage.setItem('codex-wire-cost-range',range);}catch(e){}
   const tog=document.getElementById('cost_toggle');
   if(tog)[...tog.querySelectorAll('button')].forEach(b=>b.classList.toggle('on',b.dataset.range===range));
+  hideCostHover();
   const g=document.getElementById('costgraph');
   if(g){g.style.opacity='0';setTimeout(()=>{if(latest)renderCost(latest);g.style.opacity='';},120);}
   else if(latest)renderCost(latest);
@@ -2036,6 +2161,8 @@ document.getElementById('compact_btn').addEventListener('click',e=>{document.bod
 document.getElementById('clear_state_btn').addEventListener('click',clearState);
 document.getElementById('cost_toggle').addEventListener('click',e=>{const b=e.target.closest('button[data-range]');if(b)setCostRange(b.dataset.range);});
 [...document.querySelectorAll('#cost_toggle button')].forEach(b=>b.classList.toggle('on',b.dataset.range===costRange));
+document.getElementById('costwrap').addEventListener('mousemove',moveCostHover);
+document.getElementById('costwrap').addEventListener('mouseleave',hideCostHover);
 document.getElementById('rate_toggle').addEventListener('click',e=>{const b=e.target.closest('button[data-rw]');if(b)setRateWin(b.dataset.rw);});
 [...document.querySelectorAll('#rate_toggle button')].forEach(b=>b.classList.toggle('on',b.dataset.rw===rateWin));
 document.getElementById('wire').addEventListener('click',e=>{
