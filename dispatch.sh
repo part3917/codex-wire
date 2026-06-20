@@ -50,30 +50,10 @@ fi
 mkdir -p "$OUTDIR" || die "failed to create output directory: $OUTDIR"
 
 make_outfile() {
-  out="$(mktemp "$OUTDIR/codex_XXXXXX.md" 2>/dev/null)" || return 1
-
-  if [ "$(basename "$out")" != "codex_XXXXXX.md" ]; then
-    echo "$out"
-    return 0
-  fi
-
-  # BSD mktemp only replaces trailing Xs. Keep the requested form on GNU, but
-  # fall back to a mktemp-derived name that still ends in .md on macOS.
-  rm -f "$out"
-  tries=0
-  while [ "$tries" -lt 20 ]; do
-    base="$(mktemp "$OUTDIR/codex_XXXXXX" 2>/dev/null)" || return 1
-    candidate="${base}.md"
-    if ( set -C; : > "$candidate" ) 2>/dev/null; then
-      rm -f "$base"
-      echo "$candidate"
-      return 0
-    fi
-    rm -f "$base"
-    tries=$((tries + 1))
-  done
-
-  return 1
+  base="$(mktemp "$OUTDIR/codex_XXXXXX" 2>/dev/null)" || return 1
+  out="${base}.md"
+  mv "$base" "$out" || return 1
+  echo "$out"
 }
 
 OUT="$(make_outfile)" || die "failed to create output file in: $OUTDIR"
