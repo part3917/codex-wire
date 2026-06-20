@@ -1546,10 +1546,22 @@ body{
   font-family:"JetBrains Mono",monospace; font-size:13px; line-height:1.5;
   padding:30px clamp(14px,4.5vw,70px) 80px; min-height:100vh; position:relative; overflow-x:hidden;
 }
+body::before,body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:0}
+body::before{
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180' viewBox='0 0 180 180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.72' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='180' height='180' filter='url(%23n)' opacity='.72'/%3E%3C/svg%3E");
+  opacity:.04;mix-blend-mode:multiply;
+}
+body::after{background:radial-gradient(ellipse at center,rgba(51,39,26,0) 54%,rgba(91,61,29,.08) 78%,rgba(51,39,26,.18) 100%)}
+body>*{position:relative;z-index:1}
+body.offline{filter:saturate(.4)}
 
 .mast{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;flex-wrap:wrap;
-  border-bottom:3px double #b79b6a;padding-bottom:16px;position:relative}
+  border-bottom:3px double #b79b6a;padding-bottom:14px;position:relative}
 .mast:after{content:"";position:absolute;left:0;right:0;bottom:-6px;height:1px;background:#cbb588}
+.mastmeta{display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap;
+  margin:9px 0 0;padding:5px 0 4px;border-top:1px solid #d4bf92;border-bottom:1px solid #d4bf92;
+  color:var(--dim);font:600 10px "Saira Condensed",sans-serif;letter-spacing:.2em;text-transform:uppercase}
+.mastmeta .dot{color:var(--faint);letter-spacing:0}
 .brand{display:flex;align-items:baseline;gap:16px}
 .brand h1{font-family:"Bodoni Moda",serif;font-style:italic;font-weight:600;
   font-size:clamp(34px,6vw,62px);letter-spacing:0;line-height:.9;color:#2a1d10;
@@ -1560,6 +1572,13 @@ body{
 .dateline{text-align:right;font-family:"Saira Condensed",sans-serif;letter-spacing:.18em;
   text-transform:uppercase;color:var(--dim);font-size:12px;line-height:1.7}
 .dateline b{color:var(--paper)}
+.bulletin{display:inline-block;font-family:"Saira Condensed",sans-serif;font-weight:700;
+  letter-spacing:.18em;text-transform:uppercase;color:var(--faint)}
+.bulletin .stale{color:var(--warn)}.bulletin .err{color:var(--bad)}
+.wirebanner{display:none;margin:12px 0 8px;border:1px solid #c9b382;border-left:3px solid var(--bad);
+  background:linear-gradient(180deg,#e5d5b6,#dfcba5);color:var(--bad);
+  font:700 12px "Saira Condensed",sans-serif;letter-spacing:.2em;text-transform:uppercase;
+  padding:8px 12px}
 
 .strip{display:flex;flex-wrap:wrap;gap:0;margin:20px 0 8px;border:1px solid #cbb588;
   background:linear-gradient(180deg,#ede1c8,#e4d6b8)}
@@ -1572,7 +1591,9 @@ body{
 .onair{display:inline-flex;align-items:center;gap:9px}
 .lamp{width:11px;height:11px;border-radius:50%;background:#c3ad81}
 .lamp.on{background:var(--ember);animation:pulse 1.5s infinite}
+.lamp.bad{background:var(--bad);animation:badpulse 1.15s infinite}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(207,89,21,.55)}70%{box-shadow:0 0 0 11px rgba(207,89,21,0)}100%{box-shadow:0 0 0 0 rgba(207,89,21,0)}}
+@keyframes badpulse{0%{box-shadow:0 0 0 0 rgba(169,54,34,.5)}70%{box-shadow:0 0 0 11px rgba(169,54,34,0)}100%{box-shadow:0 0 0 0 rgba(169,54,34,0)}}
 .ratetog{display:inline-flex;margin-left:8px;border:1px solid #c2aa78;background:#fbf3e1;vertical-align:middle}
 .ratetog button{appearance:none;cursor:pointer;border:0;border-left:1px solid #ddcaa0;background:transparent;
   font:700 9px "Saira Condensed",sans-serif;letter-spacing:.1em;text-transform:uppercase;color:#6b5638;
@@ -1581,7 +1602,11 @@ body{
 .ratetog button.on{background:#33271a;color:#f1e7d2}
 .ratetog button:hover:not(.on){background:#f1e3c6;color:#2a1d10}
 .gauge{height:5px;background:#ddcba8;margin-top:9px;overflow:hidden}
-.gauge i{display:block;height:100%;background:linear-gradient(90deg,var(--ember),#e8893f);transition:width .6s}
+.gauge i{display:block;height:100%;background:var(--wire);transition:width .6s,background-color .2s}
+.gauge i.rate-ok{background:var(--wire)}
+.gauge i.rate-warn{background:var(--warn)}
+.gauge i.rate-bad{background:var(--bad);animation:ratepulse 1.2s infinite}
+@keyframes ratepulse{0%,100%{opacity:1}50%{opacity:.66}}
 
 .costwrap{position:relative;margin:14px 0 6px;border:1px solid #cbb588;
   background:linear-gradient(180deg,#f3e8cf 0%,#ece0c6 100%);overflow:hidden;height:138px}
@@ -1590,6 +1615,8 @@ body{
   transition:opacity .28s ease;animation:costin .55s ease both}
 @keyframes costin{from{opacity:0}to{opacity:1}}
 .costline{stroke:var(--ember);stroke-width:2.2;fill:none;stroke-linejoin:miter;stroke-linecap:butt}
+#costreveal.reveal-once{animation:costreveal .9s ease forwards}
+@keyframes costreveal{from{clip-path:inset(0 100% 0 0)}to{clip-path:inset(0 0 0 0)}}
 .costarea{fill:url(#costfill);stroke:none}
 .costbase{stroke:#cbb588;stroke-width:1;stroke-dasharray:2 5;vector-effect:non-scaling-stroke;opacity:.6}
 .costguide{stroke:#b79b6a;stroke-width:1;vector-effect:non-scaling-stroke;opacity:.26}
@@ -1660,8 +1687,11 @@ body{
 
 .sec{display:flex;align-items:center;gap:14px;margin:34px 0 16px}
 .sec h2{font-family:"Bodoni Moda",serif;font-style:italic;font-weight:500;font-size:21px;color:#2a1d10;white-space:nowrap}
-.sec .ko{font-family:"Saira Condensed",sans-serif;letter-spacing:.3em;text-transform:uppercase;font-size:11px;color:var(--ember)}
-.sec .rule{flex:1;height:1px;background:repeating-linear-gradient(90deg,#cbb588 0 6px,transparent 6px 10px)}
+.sec .ko{font-family:"Saira Condensed",sans-serif;letter-spacing:.26em;text-transform:uppercase;font-size:10.5px;color:var(--dim)}
+.sec .rule{flex:1;height:1px;position:relative;
+  background:repeating-linear-gradient(90deg,#bfa779 0 2px,transparent 2px 7px,#d8c7a4 7px 8px,transparent 8px 13px)}
+.sec .rule:after{content:"※";position:absolute;right:0;top:50%;transform:translateY(-52%);
+  color:var(--faint);background:var(--ink);padding-left:9px;font:12px "Bodoni Moda",serif}
 
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,380px),1fr));gap:16px}
 .card{border:1px solid #cdb98f;background:linear-gradient(180deg,#fcf7ec,#f5eedc);position:relative;overflow:hidden;
@@ -1679,15 +1709,17 @@ body{
 .pill.killed .d,.pill.interrupted .d{animation:blink .75s infinite}
 @keyframes blink{50%{opacity:.25}}
 .kv{font-size:11px;color:var(--dim)} .kv b{color:var(--paper);font-weight:600}
-.chip{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#4c6a1d;border:1px solid #bcd08e;padding:2px 7px;background:#edf2da}
-.stage{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#2e5d78;border:1px solid #b6cfdb;padding:2px 7px;background:#e5f0f2}
+.chip{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#5f513d;border:1px solid #d8c7a4;padding:2px 7px;background:#f8efd9}
+.stage{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#6b5638;border:1px solid #d8c7a4;padding:2px 7px;background:#f5ead3}
 .signal{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:#5f513d;border:1px solid #d4c19b;padding:2px 7px;background:#f8efd9}
 .signal.med{color:#7d5b12;border-color:#d8bb72;background:#fbf0cb}.signal.high{color:#8f2b1e;border-color:#d99b8d;background:#fae4dc}
 .errbadges{display:flex;gap:5px;flex-wrap:wrap}.errbadge{font-size:10px;letter-spacing:.09em;text-transform:uppercase;border:1px solid #d8c7a4;padding:2px 6px;background:#fff8e9;color:#5a4631}
 .errbadge.exit{color:var(--bad);border-color:#d9a193;background:#fae4dc}.errbadge.timeout{color:#805100;border-color:#d6b65e;background:#fbefc3}
-.errbadge.permission,.errbadge.sandbox{color:#683f84;border-color:#c4abd9;background:#efe6f7}.errbadge.network{color:#24627f;border-color:#9bc5d8;background:#e3f0f4}.errbadge.jsonl{color:#8d3f13;border-color:#dfa16c;background:#f7e5d4}
+.errbadge.permission,.errbadge.sandbox{color:#6b5638;border-color:#d8c7a4;background:#f5ead3}.errbadge.network{color:#5f513d;border-color:#d8c7a4;background:#f8efd9}.errbadge.jsonl{color:#8d3f13;border-color:#dfa16c;background:#f7e5d4}
 .age.zombie,.age.error,.age.killed,.age.interrupted{color:var(--bad);font-weight:700}
 .el{margin-left:auto;font-variant-numeric:tabular-nums;color:var(--ember2);font-weight:700;font-size:15px}
+.el .el-last.flash{display:inline-block;animation:elapsedflash .24s ease}
+@keyframes elapsedflash{0%{color:var(--paper);opacity:.52}45%{color:var(--ember);opacity:1}100%{color:var(--ember2);opacity:1}}
 .acts{display:flex;gap:5px}
 .acts button,.toggle-more{border:1px solid #d8c7a4;background:#fff8e9;color:#5a4631;font:10px "JetBrains Mono",monospace;padding:3px 6px;cursor:pointer}
 .acts button.kill{color:var(--bad);border-color:#d9a193}.acts button.pinbtn.on{background:#33271a;color:#f1e7d2;border-color:#33271a}
@@ -1702,7 +1734,7 @@ body{
 .minifeed{border-top:1px solid #e6d6b2;padding-top:9px;font-size:11px;color:var(--dim)}
 .minifeed .ev{display:flex;gap:8px;padding:2px 0;align-items:baseline}
 .ic{font-style:normal;width:13px;flex:none;text-align:center}
-.ic.cmd{color:var(--wire)} .ic.edit{color:var(--ember2)} .ic.msg{color:var(--dim)} .ic.err{color:var(--bad)} .ic.out{color:var(--faint)}
+.ic.cmd{color:var(--dim)} .ic.edit{color:var(--ember2)} .ic.msg{color:var(--dim)} .ic.err{color:var(--bad)} .ic.out{color:var(--faint)}
 .minifeed .tx{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#5a4631}
 .msgbox{margin-top:10px;font-style:italic;font-family:"Bodoni Moda",serif;font-size:13px;color:#5a4028;
   border-top:1px dashed #d8c7a4;padding-top:9px;line-height:1.45}
@@ -1718,11 +1750,19 @@ body{
   animation:rise .4s ease}
 @keyframes rise{from{opacity:0;transform:translateY(-4px)}to{opacity:1}}
 .wline:nth-child(even){background:#f8f1e2}
+.wline.new{position:relative;overflow:hidden;animation:rise .4s ease,wirestamp .8s ease-out}
+.wline.new:before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--ember);
+  transform-origin:top;animation:wirewipe .75s ease-out forwards}
+.wline.new.err{animation:rise .4s ease,wirestampErr .9s ease-out}
+.wline.new.err:before{width:4px;background:var(--bad)}
+@keyframes wirestamp{0%{background:#f1e3c6}100%{background:transparent}}
+@keyframes wirestampErr{0%{background:#f2b39f}55%{background:#fae5dc}100%{background:transparent}}
+@keyframes wirewipe{0%{transform:scaleY(0);opacity:1}38%{transform:scaleY(1);opacity:1}100%{transform:scaleY(1);opacity:0}}
 .wline .wt{color:var(--faint);font-size:10.5px;min-width:64px;font-variant-numeric:tabular-nums}
 .wline .src{color:var(--ember);font-size:10px;text-transform:uppercase;letter-spacing:.1em;min-width:88px;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .wline .wx{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#3a2c1c;font-size:11.5px}
-.wline.cmd .wi{color:var(--wire)} .wline.edit .wi{color:var(--ember2)} .wline.msg .wi{color:var(--blue);font-style:italic}
+.wline.cmd .wi{color:var(--dim)} .wline.edit .wi{color:var(--ember2)} .wline.msg .wi{color:var(--dim);font-style:italic}
 .wline.err{background:#fae5dc}.wline.err .wi,.wline.err .wx{color:var(--bad);font-weight:700}.wline.out{opacity:.55}
 .wline.clip{cursor:pointer}
 .wline.clip:hover{background:#f1e3c6}
@@ -1730,14 +1770,47 @@ body{
 .wline.expanded .wx{white-space:normal;overflow:visible;text-overflow:clip;word-break:break-word}
 .wi{width:14px;flex:none;text-align:center}
 
-.rec{display:flex;gap:14px;align-items:baseline;padding:10px 0;border-bottom:1px solid #ddcba8}
+.rec{position:relative;display:flex;gap:12px;align-items:baseline;padding:9px 12px 9px 0;border-bottom:1px solid var(--recent-rule,#ecddc1);
+  transition:background .16s ease,box-shadow .16s ease}
+.rec:nth-child(even){background:var(--recent-tint,#f8f1e2)}
+.rec:hover{background:var(--recent-hover,#f1e3c6);box-shadow:inset 2px 0 0 var(--ember)}
+.rec .idx{width:30px;flex:0 0 30px;text-align:right;color:var(--faint);font:500 10px "JetBrains Mono",monospace;
+  font-variant-numeric:tabular-nums;opacity:.78}
 .rec .ago{color:var(--faint);min-width:58px;text-align:right;font-variant-numeric:tabular-nums;font-size:11px}
 .rec .src{color:var(--ember);font-size:10px;text-transform:uppercase;letter-spacing:.12em;min-width:84px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.rec .p{flex:1;color:#4a3a26;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
-.rec .n{color:var(--dim);font-size:10.5px;white-space:nowrap}
+.rec .p{flex:1;min-width:0;color:#4a3a26;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
+.rec .n{color:var(--dim);font-size:10.5px;white-space:nowrap;font-variant-numeric:tabular-nums}
 .rec.error .p,.rec.error .n{color:var(--bad)}
 .rec.killed .p,.rec.killed .n{color:var(--kill);font-weight:700}.rec.interrupted .p,.rec.interrupted .n{color:var(--interrupt);font-weight:700}
-.empty{color:var(--faint);font-style:italic;font-family:"Bodoni Moda",serif;padding:22px 4px;font-size:15px}
+#recent{position:relative;--recent-rule:#ecddc1;--recent-tint:#f8f1e2;--recent-hover:#f1e3c6}
+.recent-control{margin-left:auto;display:inline-flex;align-items:center;gap:7px}
+.recent-control span{font:700 10px "Saira Condensed",sans-serif;letter-spacing:.18em;text-transform:uppercase;color:var(--dim)}
+.recent-select{height:30px;border:1px solid #c9b382;background:#fff8e9;color:var(--paper);
+  font:12px "JetBrains Mono",monospace;padding:0 9px;box-shadow:0 1px 0 rgba(255,250,238,.5)}
+.recent-list{position:relative;overflow:hidden;transition:max-height .36s ease}
+.rec.recent-new{animation:recentfade .34s ease both}
+@keyframes recentfade{from{opacity:0;transform:translateY(-5px)}to{opacity:1;transform:translateY(0)}}
+.recent-more{position:relative;margin-top:-36px;padding-top:44px;pointer-events:none}
+.recent-fade{position:absolute;left:0;right:0;top:0;height:40px;
+  background:linear-gradient(180deg,rgba(241,231,210,0) 0%,rgba(241,231,210,.78) 62%,var(--ink) 100%)}
+.recent-collapse{display:flex;justify-content:center;padding:12px 0 2px}
+.recent-continued{position:relative;z-index:1;width:100%;display:flex;align-items:center;justify-content:center;gap:10px;
+  border:0;background:transparent;color:var(--dim);cursor:pointer;pointer-events:auto;padding:7px 0;
+  font:700 11px "Saira Condensed",sans-serif;letter-spacing:.18em;text-transform:uppercase;
+  transition:color .15s ease}
+.recent-continued:before,.recent-continued:after{content:"";height:1px;flex:1;
+  background:linear-gradient(90deg,transparent,var(--line) 26%,var(--line) 74%,transparent)}
+.recent-continued:hover{color:var(--ember)}
+.recent-continued:focus-visible{outline:2px solid var(--ember);outline-offset:2px}
+.recent-chevron{display:inline-flex;align-items:center;justify-content:center;color:var(--ember)}
+.recent-chevron svg{width:20px;height:20px}
+.recent-continued .label{color:inherit}
+.recent-continued .remain{color:var(--faint);font:500 10px "JetBrains Mono",monospace;letter-spacing:.04em;text-transform:none}
+.empty{color:var(--faint);font-style:italic;font-family:"Bodoni Moda",serif;padding:22px 4px;font-size:15px;text-align:center;
+  position:relative;letter-spacing:.02em}
+.empty:before,.empty:after{content:"";display:block;height:1px;margin:0 0 12px;
+  background:repeating-linear-gradient(90deg,#cbb588 0 2px,transparent 2px 7px);opacity:.72}
+.empty:after{margin:12px 0 0}
 
 body.compact .grid{display:flex;flex-direction:column;gap:7px}
 body.compact .card .hd{padding:8px 12px}
@@ -1756,25 +1829,33 @@ body.compact .kv.prompt-head{display:inline;max-width:38vw;overflow:hidden;text-
 
 footer{margin-top:40px;color:var(--faint);font-size:10.5px;border-top:1px solid #cbb588;padding-top:14px;
   font-family:"Saira Condensed",sans-serif;letter-spacing:.16em;text-transform:uppercase;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
-::-webkit-scrollbar{width:7px;height:7px}::-webkit-scrollbar-thumb{background:#cdb98f}::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar{width:7px;height:7px}::-webkit-scrollbar-thumb{background:#cf5915}::-webkit-scrollbar-track{background:transparent}
 @media(max-width:640px){
-  body{padding-inline:12px}.brand{display:block}.dateline{text-align:left}.controls input{min-width:100%}.controls input.mini{min-width:54px;width:54px;flex:0}.controls .switch input{min-width:0;width:1px;height:1px;flex:0}.refresh-note{margin-left:0;width:100%}
-  .stat{min-width:50%;border-bottom:1px solid #d3c096}.rec{gap:8px}.rec .src{min-width:64px}.acts{width:100%}.el{margin-left:0}
+  body{padding-inline:12px}.brand{display:block}.mastmeta{justify-content:flex-start}.dateline{text-align:left}.controls input{min-width:100%}.controls input.mini{min-width:54px;width:54px;flex:0}.controls .switch input{min-width:0;width:1px;height:1px;flex:0}.refresh-note{margin-left:0;width:100%}
+  .stat{min-width:50%;border-bottom:1px solid #d3c096}.sec{gap:10px}.recent-control{margin-left:auto}.rec{gap:8px;padding-right:8px}.rec .idx{width:24px;flex-basis:24px}.rec .src{min-width:64px}.acts{width:100%}.el{margin-left:0}
 }
 </style></head><body>
 
 <div class=mast>
   <div class=brand>
     <h1>Codex<b>·</b>Wire</h1>
-    <span class=sub>Subagent telemetry</span>
+    <span class=sub>Live Dispatch Ledger</span>
   </div>
-  <div class=dateline><span class=onair><span id=lamp class=lamp></span> <b id=onair>OFF AIR</b></span><br><span id=date>—</span> · <b id=ts>—</b><br><span id=refresh_state>polling</span></div>
+  <div class=dateline><span class=onair><span id=lamp class=lamp></span> <b id=onair>OFF AIR</b></span><br><span id=date>—</span> · <b id=ts>—</b><br><span id=refresh_state>polling</span><br><span id=bulletin class=bulletin>ALL CLEAR</span></div>
 </div>
+<div class=mastmeta aria-label="publication metadata">
+  <span>EST. ~/.codex</span><span class=dot>·</span>
+  <span>VOL. <b id=meta_date>—</b></span><span class=dot>·</span>
+  <span>NO. <b id=meta_no>—</b></span><span class=dot>·</span>
+  <span>EX MACHINA · NUNTIUS</span>
+</div>
+
+<div id=wirebanner class=wirebanner></div>
 
 <div class=strip>
   <div class=stat title="running codex processes from ps"><div class=l>Live</div><div class=v id=s_run>—</div></div>
   <div class=stat title="오늘 생성된 codex 세션 파일 수"><div class=l>Sessions today</div><div class=v id=s_today>—</div></div>
-  <div class=stat><div class=l>Rate<span class=ratetog id=rate_toggle><button type=button data-rw=5h class=on>5h</button><button type=button data-rw=7d>7d</button></span></div><div class=v id=s_rate>—<small>%</small></div><div class=gauge><i id=s_rate_bar style=width:0%></i></div></div>
+  <div class=stat><div class=l>Rate<span class=ratetog id=rate_toggle role=group aria-label="rate timeframe"><button type=button data-rw=5h class=on aria-pressed=true>5h</button><button type=button data-rw=7d aria-pressed=false>7d</button></span></div><div class=v id=s_rate>—<small>%</small></div><div class=gauge><i id=s_rate_bar style=width:0%></i></div></div>
   <div class=stat title="feed from sessions active in last 30m, capped at 80 lines"><div class=l>Wire feed</div><div class=v id=s_feed>—</div></div>
 </div>
 
@@ -1789,8 +1870,10 @@ footer{margin-top:40px;color:var(--faint);font-size:10.5px;border-top:1px solid 
     </defs>
     <g id=costgridh></g>
     <g id=costguides></g>
-    <path id=costarea class=costarea d=""/>
-    <path id=costline class=costline d="" vector-effect=non-scaling-stroke pathLength="1"/>
+    <g id=costreveal>
+      <path id=costarea class=costarea d=""/>
+      <path id=costline class=costline d="" vector-effect=non-scaling-stroke pathLength="1"/>
+    </g>
     <line id=costhover class=costhover x1="0" y1="0" x2="0" y2="100" visibility=hidden/>
   </svg>
   <div class=costdot id=costdot></div>
@@ -1803,12 +1886,12 @@ footer{margin-top:40px;color:var(--faint);font-size:10.5px;border-top:1px solid 
       <div class=costnum><span class=cur>$</span><span id=cost_amount>0.00</span></div>
       <div class=costsub><b id=cost_tokens>—</b> tok · peak <b id=cost_peak>$0.00</b><span id=cost_estflag></span></div>
     </div>
-    <div class=costtoggle id=cost_toggle role=tablist aria-label="cost timeframe">
-      <button type=button data-range=5h class=on>5H</button>
-      <button type=button data-range=day>Day</button>
-      <button type=button data-range=week>Wk</button>
-      <button type=button data-range=month>Mo</button>
-      <button type=button data-range=year>Yr</button>
+    <div class=costtoggle id=cost_toggle role=group aria-label="cost timeframe">
+      <button type=button data-range=5h class=on aria-pressed=true>5H</button>
+      <button type=button data-range=day aria-pressed=false>Day</button>
+      <button type=button data-range=week aria-pressed=false>Wk</button>
+      <button type=button data-range=month aria-pressed=false>Mo</button>
+      <button type=button data-range=year aria-pressed=false>Yr</button>
     </div>
   </div>
 </div>
@@ -1840,7 +1923,7 @@ footer{margin-top:40px;color:var(--faint);font-size:10.5px;border-top:1px solid 
 <div class=sec><span class=ko>Wire feed</span><h2>Live Telegraph</h2><div class=rule></div></div>
 <div class=wire id=wire></div>
 
-<div class=sec><span class=ko>Logbook</span><h2>Recent Dispatches</h2><div class=rule></div></div>
+<div class=sec><span class=ko>Logbook</span><h2>Recent Dispatches</h2><div class=rule></div><label class=recent-control><span>Entries</span><select id=recent_limit class=recent-select aria-label="Recent dispatch count"><option value=10>10</option><option value=20>20</option><option value=30>30</option><option value=40>40</option><option value=50>50</option></select></label></div>
 <div id=recent></div>
 
 <footer><span>CODEX WIRE · ps + ~/.codex/sessions · controlled polling</span><span>by 3917</span></footer>
@@ -1858,6 +1941,21 @@ function fmtRecentAge(m){m=Math.floor(Number(m)||0); const mm=String(m%60).padSt
 function fmtTok(n){n=Number(n||0); if(n>=1000000)return (n/1000000).toFixed(1)+'M'; if(n>=1000)return Math.round(n/100)/10+'k'; return String(n);}
 function setText(el,v){if(el&&el.textContent!==String(v??''))el.textContent=String(v??'');}
 function setHTML(el,v){if(el&&el.innerHTML!==v)el.innerHTML=v;}
+function syncPressedButtons(root, attr, value){
+  const el=typeof root==='string'?document.querySelector(root):root;
+  if(!el)return;
+  [...el.querySelectorAll('button')].forEach(b=>{
+    const on=b.dataset[attr]===value;
+    b.classList.toggle('on',on);
+    b.setAttribute('aria-pressed',on?'true':'false');
+  });
+}
+function emptyHTML(text){return `<div class=empty>${esc(text)}</div>`;}
+function formatElapsedHTML(value, flash=false){
+  const s=esc(value||'');
+  return s.replace(/(\d)$/,`<span class="el-last${flash?' flash':''}">$1</span>`);
+}
+function paintElapsed(el,value,flash=false){if(el)setHTML(el,formatElapsedHTML(value,flash));}
 function shortErr(e){
   return String((e&&e.message)||e||'unknown error').replace(/\s+/g,' ').slice(0,90);
 }
@@ -1872,23 +1970,43 @@ function toast(msg, kind='ok'){
 function renderRateStat(value, valueId, barId){
   const n=Number(value), ok=Number.isFinite(n);
   setHTML(document.getElementById(valueId),(ok?Math.round(n):'—')+'<small>%</small>');
-  document.getElementById(barId).style.width=(ok?Math.min(100,Math.max(0,n)):0)+'%';
+  const bar=document.getElementById(barId);
+  if(!bar)return;
+  const pct=ok?Math.min(100,Math.max(0,n)):0;
+  bar.style.width=pct+'%';
+  bar.classList.remove('rate-ok','rate-warn','rate-bad');
+  if(ok)bar.classList.add(pct>85?'rate-bad':(pct>=70?'rate-warn':'rate-ok'));
 }
 let rateWin='5h';
 try{const rw=localStorage.getItem('codex-wire-rate-win'); if(rw==='5h'||rw==='7d')rateWin=rw;}catch(e){}
 function renderRate(d){renderRateStat(rateWin==='7d'?d.rate7d:d.rate,'s_rate','s_rate_bar');}
+function setWireBanner(msg){
+  const el=document.getElementById('wirebanner'); if(!el)return;
+  if(msg){setText(el,msg);el.style.display='block';}
+  else{setText(el,'');el.style.display='none';}
+}
+function renderBulletin(d){
+  const c=(d&&d.status_counts)||{};
+  const zombie=Number(c.zombie||0), error=Number(c.error||0);
+  const el=document.getElementById('bulletin'); if(!el)return {zombie,error};
+  if(zombie>0||error>0){
+    setHTML(el,`<span class=stale>● ${zombie} STALE</span> · <span class=err>✕ ${error} ERROR</span>`);
+  }else{
+    setText(el,'ALL CLEAR');
+  }
+  return {zombie,error};
+}
 function setRateWin(w){
   if(w!=='5h'&&w!=='7d')return;
   rateWin=w;
   try{localStorage.setItem('codex-wire-rate-win',w);}catch(e){}
-  const t=document.getElementById('rate_toggle');
-  if(t)[...t.querySelectorAll('button')].forEach(b=>b.classList.toggle('on',b.dataset.rw===w));
+  syncPressedButtons('#rate_toggle','rw',w);
   if(latest)renderRate(latest);
 }
 const COST_LABEL={'5h':'5h session','day':'last 24h','week':'last 7 days','month':'last 30 days','year':'last 12 months'};
 let costRange='5h';
 try{const cr=localStorage.getItem('codex-wire-cost-range'); if(cr&&COST_LABEL[cr])costRange=cr;}catch(e){}
-let _costHover={points:[],peak:1,blabels:[]};
+let _costHover={points:[],peak:1,blabels:[]}, costLineDrawn=false;
 // Sharp (no smoothing) area path in a 0..100 viewBox; non-scaling stroke keeps
 // the line crisp while the area stretches to the panel.
 function costPath(points){
@@ -1919,8 +2037,14 @@ function renderCost(d){
   setText(document.getElementById('cost_estflag'),d.cost_estimate?' · est':'');
   _costHover={points:pts,peak:(pts.length?Math.max.apply(null,pts.concat(0)):0)||1,blabels:r.blabels||[]};
   const p=costPath(pts);
-  const lEl=document.getElementById('costline'),aEl=document.getElementById('costarea');
-  if(lEl)lEl.setAttribute('d',p.line);
+  const lEl=document.getElementById('costline'),aEl=document.getElementById('costarea'),rEl=document.getElementById('costreveal');
+  if(lEl){
+    lEl.setAttribute('d',p.line);
+    if(p.line&&!costLineDrawn&&rEl){
+      costLineDrawn=true; rEl.classList.add('reveal-once');
+      setTimeout(()=>rEl.classList.remove('reveal-once'),950);
+    }
+  }
   if(aEl)aEl.setAttribute('d',p.area);
   renderCostAxis(r.axis);
   renderCostGrid(peak);
@@ -2000,8 +2124,7 @@ function setCostRange(range){
   if(!COST_LABEL[range])return;
   costRange=range;
   try{localStorage.setItem('codex-wire-cost-range',range);}catch(e){}
-  const tog=document.getElementById('cost_toggle');
-  if(tog)[...tog.querySelectorAll('button')].forEach(b=>b.classList.toggle('on',b.dataset.range===range));
+  syncPressedButtons('#cost_toggle','range',range);
   hideCostHover();
   const g=document.getElementById('costgraph');
   if(g){g.style.opacity='0';setTimeout(()=>{if(latest)renderCost(latest);g.style.opacity='';},120);}
@@ -2013,6 +2136,9 @@ let orderSeed={}, orderSeq=0, controlState={}, statusSeen={}, errorSeen={}, idle
 const STORE='codex-wire-state-v2';
 const NOTIFY_STORE='codex-wire-notify-v3';
 const NOTIFY_DEFAULTS={master:false,zombie:false,error:false,rate:false,rateLimit:80,idle:false,idleMin:10};
+const RECENT_OPTIONS=[10,20,30,40,50], RECENT_STEP=10, RECENT_MAX=50, RECENT_STORE='codex-wire-recent-n';
+let recentN=10, recentRevealFrom=null;
+try{const rn=Number(localStorage.getItem(RECENT_STORE)); if(RECENT_OPTIONS.includes(rn))recentN=rn;}catch(e){}
 
 function stableId(j){return String((j&&j.out)||(j&&j.key)||(j&&j.pid)||'');}
 function cardKey(j){return 'job_'+stableId(j).replace(/[^a-zA-Z0-9_-]/g,'_');}
@@ -2120,7 +2246,7 @@ function patchCard(el,j){
      <span class="kv prompt-head">${esc((j.prompt||'').replace(/\s+/g,' ').slice(0,90))}</span>
      <span class=chip>${esc(j.sandbox)}</span><span class=stage>${esc(j.stage)}</span>${activityHTML(j)}${errBadges(j)}
      <span class="kv age ${j.status}">last ${fmtAge(j.last_age_sec)}</span>
-     <span class=el id=el_${esc(j.pid)}>${esc(j.elapsed)}</span>
+     <span class=el id=el_${esc(j.pid)}>${formatElapsedHTML(j.elapsed)}</span>
      <span class=acts><button class="pinbtn ${pinned?'on':''}" data-act=pin title="pin job">★</button><button data-act=copy>copy cmd</button><button data-act=retry>retry</button><button class=kill data-act=kill>kill</button></span></div>
     <div class=bd>${promptBlock(j)}
      <div class=telem>${telem(j)}</div>
@@ -2135,7 +2261,9 @@ function renderCards(){
   let empty=R.querySelector('.empty'); if(list.length&&empty)empty.remove();
   if(!list.length){
     [...R.children].forEach(ch=>{if(ch.classList.contains('card'))ch.remove();});
-    if(!empty){empty=document.createElement('div');empty.className='empty';empty.textContent='Idle — no Codex jobs match the filter.';R.appendChild(empty);}
+    const msg=(latest&&latest.running&&latest.running.length>0)?'NO MATCH — 필터에 맞는 작업 없음':'── NO DISPATCHES ON THE WIRE ──';
+    if(!empty){empty=document.createElement('div');empty.className='empty';R.appendChild(empty);}
+    setText(empty,msg);
     return;
   }
   for(const j of list){
@@ -2148,24 +2276,72 @@ function renderCards(){
 }
 function renderWire(feed){
   const W=document.getElementById('wire');
-  if(!feed.length){ seen.clear(); W.innerHTML='<div class=empty style=padding:16px>Quiet wire.</div>'; return; }
+  if(!feed.length){ seen.clear(); setHTML(W,emptyHTML('── THE WIRE IS QUIET ──')); return; }
   const ph=W.querySelector('.empty'); if(ph) ph.remove();
   const fresh=feed.filter(e=>{const k=e.ts+'|'+e.k+'|'+e.t+'|'+e.src; if(seen.has(k))return false; seen.add(k); return true;});
   for(let i=fresh.length-1;i>=0;i--){const e=fresh[i];
-    const div=document.createElement('div'); div.className='wline '+e.k;
+    const div=document.createElement('div'); div.className='wline new '+e.k;
     div.innerHTML=`<span class=wt>${hhmm(e.ts)}</span><span class=wi>${ICON[e.k]||'·'}</span><span class=src>${esc(e.src)}</span><span class=wx>${esc(e.t)}</span>`;
     W.insertBefore(div, W.firstChild);
+    setTimeout(()=>div.classList.remove('new'),1200);
     const wx=div.querySelector('.wx'); if(wx && wx.scrollWidth>wx.clientWidth+1) div.classList.add('clip');
   }
   while(W.children.length>80) W.removeChild(W.lastChild);
   if(seen.size>600){ seen=new Set(feed.map(e=>e.ts+'|'+e.k+'|'+e.t+'|'+e.src)); }
 }
+function recentChevron(dir){
+  return dir==='up'
+    ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m7 18 5-5 5 5"/><path d="m7 11 5-5 5 5"/></svg>'
+    : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m7 6 5 5 5-5"/><path d="m7 13 5 5 5-5"/></svg>';
+}
+function normalizeRecentN(n){
+  n=Number(n)||RECENT_STEP;
+  return RECENT_OPTIONS.reduce((best,v)=>Math.abs(v-n)<Math.abs(best-n)?v:best,RECENT_STEP);
+}
+function saveRecentN(){try{localStorage.setItem(RECENT_STORE,String(recentN));}catch(e){}}
+function syncRecentSelect(total){
+  const sel=document.getElementById('recent_limit'); if(!sel)return;
+  sel.value=String(recentN);
+  sel.disabled=!(total>0);
+  sel.title=total>0?String(Math.min(total,RECENT_MAX))+' dispatches available':'No dispatches';
+  sel.setAttribute('aria-label','Recent dispatch count');
+}
+function setRecentN(n,reveal=false){
+  const old=recentN, next=normalizeRecentN(n);
+  if(next===old)return;
+  recentN=next; saveRecentN();
+  if(reveal&&latest&&latest.recent)recentRevealFrom=Math.min(old,latest.recent.length,RECENT_MAX);
+  if(latest)renderRecent(latest.recent);
+}
 function renderRecent(rows){
   const RE=document.getElementById('recent');
-  setHTML(RE,rows.map(s=>`<div class="rec ${s.status}">
-     <span class=ago>${fmtRecentAge(s.age_min)}</span><span class=src>${esc(s.cwd)}</span>
+  const total=Math.min((rows||[]).length,RECENT_MAX), shown=Math.min(recentN,total);
+  syncRecentSelect((rows||[]).length);
+  if(!total){setHTML(RE,emptyHTML('── LOGBOOK EMPTY ──'));return;}
+  const oldList=RE.querySelector('.recent-list'), oldHeight=oldList?oldList.getBoundingClientRect().height:0;
+  const recs=(rows||[]).slice(0,shown).map((s,i)=>`<div class="rec ${s.status}">
+     <span class=idx>${i+1}</span><span class=ago>${fmtRecentAge(s.age_min)}</span><span class=src>${esc(s.cwd)}</span>
      <span class=p>${esc(s.prompt)}</span>
-     <span class=n>${esc(statusDisplay(s))} · ${s.n_cmds}c · ${s.n_edits}e · ${fmtTok(s.token_total)}t · $${Number(s.cost||0).toFixed(3)}${s.cost_estimate?' est:fallback':''}${s.rate_pct!=null?' · '+Math.round(s.rate_pct)+'%':''}</span></div>`).join('')||'<div class=empty>No history.</div>');
+     <span class=n>${esc(statusDisplay(s))} · ${s.n_cmds}c · ${s.n_edits}e · ${fmtTok(s.token_total)}t · $${Number(s.cost||0).toFixed(3)}${s.cost_estimate?' est:fallback':''}${s.rate_pct!=null?' · '+Math.round(s.rate_pct)+'%':''}</span></div>`).join('');
+  const hasMore=shown<total&&shown<RECENT_MAX;
+  const canCollapse=shown>RECENT_STEP&&!hasMore;
+  const more=hasMore?`<div class=recent-more><div class=recent-fade></div><button class=recent-continued data-recent-more type=button aria-label="Show 10 more dispatches, ${total-shown} remaining" aria-expanded="false" title="show 10 more"><span class=recent-chevron>${recentChevron('down')}</span><span class=label>SHOW 10 MORE</span><span class=remain>· ${total-shown} more</span></button></div>`:'';
+  const collapse=canCollapse?`<div class=recent-collapse><button class=recent-continued data-recent-collapse type=button aria-label="Collapse recent dispatches" aria-expanded="true" title="collapse to 10"><span class=recent-chevron>${recentChevron('up')}</span><span class=label>COLLAPSE</span></button></div>`:'';
+  setHTML(RE,`<div class=recent-list>${recs}</div>${more}${collapse}`);
+  const list=RE.querySelector('.recent-list'), newHeight=list?list.scrollHeight:0;
+  if(list&&oldHeight&&Math.abs(newHeight-oldHeight)>1){
+    list.style.maxHeight=oldHeight+'px';
+    requestAnimationFrame(()=>{list.style.maxHeight=newHeight+'px';});
+    setTimeout(()=>{if(list.isConnected)list.style.maxHeight='none';},420);
+  }else if(list){
+    list.style.maxHeight='none';
+  }
+  if(list&&recentRevealFrom!=null){
+    [...list.querySelectorAll('.rec')].forEach((el,i)=>{
+      if(i>=recentRevealFrom){el.classList.add('recent-new');el.style.animationDelay=Math.min((i-recentRevealFrom)*24,180)+'ms';}
+    });
+    recentRevealFrom=null;
+  }
 }
 async function postJSON(url,payload){
   const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
@@ -2271,24 +2447,33 @@ function clearState(){
 async function tick(manual=false){
  try{
   const d=await (await fetch('/api',{cache:'no-store'})).json(); latest=d; lastOk=Date.now();
+  document.body.classList.remove('offline');
+  setWireBanner(d.source_degraded&&d.source_degraded.ps?'STOP PRESS — WIRE DEGRADED':'');
+  const counts=renderBulletin(d);
   setText(document.getElementById('ts'),d.ts); setText(document.getElementById('date'),d.date);
-  document.getElementById('lamp').className='lamp'+(d.count>0?' on':'');
+  setText(document.getElementById('meta_date'),d.date); setText(document.getElementById('meta_no'),d.today);
+  document.getElementById('lamp').className=counts.error>0?'lamp bad':('lamp'+(d.count>0?' on':''));
   setText(document.getElementById('onair'),d.count>0?'ON AIR':'STANDBY');
-  document.getElementById('onair').style.color=d.count>0?'var(--ember)':'var(--dim)';
+  document.getElementById('onair').style.color=counts.error>0?'var(--bad)':(d.count>0?'var(--ember)':'var(--dim)');
   setText(document.getElementById('s_run'),d.count); setText(document.getElementById('s_today'),d.today);
   renderRate(d);
   setText(document.getElementById('s_feed'),d.feed.length);
   renderCost(d);
   renderControls(d); renderCards(); renderWire(d.feed); renderRecent(d.recent); maybeAlerts(d);
   setText(document.getElementById('refresh_note'),(manual?'manual · ':'')+'updated now');
- }catch(e){setText(document.getElementById('ts'),'connection lost');setText(document.getElementById('onair'),'LINE DOWN');}
+ }catch(e){
+  document.body.classList.add('offline');setWireBanner('LINE DOWN — 연결 끊김');
+  document.getElementById('lamp').className='lamp bad';
+  setText(document.getElementById('ts'),'connection lost');setText(document.getElementById('onair'),'LINE DOWN');
+  document.getElementById('onair').style.color='var(--bad)';
+ }
 }
 function startPoll(){if(timer)clearInterval(timer);timer=setInterval(tick,pollMs);}
 setInterval(()=>{for(const pid in ticks){const el=document.getElementById('el_'+pid);if(!el)continue;
   let p=ticks[pid].split(':').map(Number);let s=p.pop()+1;let m=p.pop()||0;let h=p.pop()||0;
   if(s>59){s=0;m++;}if(m>59){m=0;h++;}
   ticks[pid]=(h?String(h).padStart(2,'0')+':':'')+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
-  el.textContent=ticks[pid];}
+  paintElapsed(el,ticks[pid],true);}
   if(lastOk){const age=Math.floor((Date.now()-lastOk)/1000);setText(document.getElementById('refresh_state'),age>pollMs/1000*3?'stale '+age+'s':'last refresh '+age+'s ago');}
 },1000);
 loadState();
@@ -2298,11 +2483,17 @@ document.getElementById('refresh_btn').addEventListener('click',()=>tick(true));
 document.getElementById('compact_btn').addEventListener('click',e=>{document.body.classList.toggle('compact');e.target.classList.toggle('on',document.body.classList.contains('compact'));saveState();});
 document.getElementById('clear_state_btn').addEventListener('click',clearState);
 document.getElementById('cost_toggle').addEventListener('click',e=>{const b=e.target.closest('button[data-range]');if(b)setCostRange(b.dataset.range);});
-[...document.querySelectorAll('#cost_toggle button')].forEach(b=>b.classList.toggle('on',b.dataset.range===costRange));
+syncPressedButtons('#cost_toggle','range',costRange);
 document.getElementById('costwrap').addEventListener('mousemove',moveCostHover);
 document.getElementById('costwrap').addEventListener('mouseleave',hideCostHover);
 document.getElementById('rate_toggle').addEventListener('click',e=>{const b=e.target.closest('button[data-rw]');if(b)setRateWin(b.dataset.rw);});
-[...document.querySelectorAll('#rate_toggle button')].forEach(b=>b.classList.toggle('on',b.dataset.rw===rateWin));
+document.getElementById('recent_limit').addEventListener('change',e=>setRecentN(e.target.value,Number(e.target.value)>recentN));
+document.getElementById('recent').addEventListener('click',e=>{
+  const more=e.target.closest('[data-recent-more]'), collapse=e.target.closest('[data-recent-collapse]');
+  if(more)setRecentN(Math.min(RECENT_MAX,recentN+RECENT_STEP),true);
+  if(collapse)setRecentN(RECENT_STEP,false);
+});
+syncPressedButtons('#rate_toggle','rw',rateWin);
 document.getElementById('wire').addEventListener('click',e=>{
   const line=e.target.closest('.wline'); if(!line)return;
   const wx=line.querySelector('.wx'); if(!wx)return;
