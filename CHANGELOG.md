@@ -8,6 +8,13 @@ for 0.x releases.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-26
+
+### Performance
+
+- Reused a persistent Codex `app-server` connection for live RPC rate-limit refreshes, initializing once per connection and repeating only `account/rateLimits/read` plus `account/read` until EOF, timeout, or failure forces a reconnect.
+- Preserved the existing rate cache across transient RPC failures while retiring broken app-server process groups with `SIGTERM`, `SIGKILL`, and process kill fallback.
+
 ## [0.6.0] - 2026-06-26
 
 ### Performance

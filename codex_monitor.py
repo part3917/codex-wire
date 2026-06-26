@@ -56,7 +56,7 @@ def _load_monitor_env():
 _load_monitor_env()
 
 PORT = 8787
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 SESS = os.path.expanduser(os.environ.get("CODEX_MONITOR_SESS_DIR", "~/.codex/sessions"))
 HOME = os.path.expanduser("~")
 
@@ -105,6 +105,8 @@ _STORAGE_HEALTH = {"cost_index_error": "", "cost_index_failed_at": 0.0,
 _STORAGE_HEALTH_LOCK = threading.Lock()
 _RPC_RATE_CACHE = None
 _RPC_RATE_CACHE_LOCK = threading.Lock()
+_RPC_RATE_CLIENT = None
+_RPC_RATE_CLIENT_LOCK = threading.Lock()
 _RPC_RATE_THREAD_STARTED = False
 _LIBC = None
 _LIBC_READY = False
@@ -690,66 +692,36 @@ def _rpc_window_rate(rate_limits, window_mins):
     return None
 
 
-def fetch_rate_via_rpc(timeout=10):
-    codex_bin = _codex_rpc_bin()
-    if not codex_bin:
-        print("codex_monitor: rate rpc unavailable; codex binary not found", file=sys.stderr)
-        return None
-    proc = None
-    try:
-        proc = subprocess.Popen([codex_bin, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, text=True, bufsize=1)
-        requests = [
-            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-             "params": {"clientInfo": {"name": "codex-wire", "version": APP_VERSION}}},
-            {"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read", "params": {}},
-            {"jsonrpc": "2.0", "id": 3, "method": "account/read", "params": {}},
-        ]
-        for req in requests:
-            proc.stdin.write(json.dumps(req, separators=(",", ":")) + "\n")
-        proc.stdin.flush()
+class _RateRpcClient:
+    def __init__(self, codex_bin, version):
+        self.codex_bin = codex_bin
+        self.version = version
+        self.proc = None
+        self.lines = None
+        self.next_id = 1
+        self.lock = threading.Lock()
 
-        lines = queue.Queue()
+    def is_alive(self):
+        return self.proc is not None and self.proc.poll() is None
 
-        def _reader():
-            try:
-                for line in proc.stdout:
-                    lines.put(line)
-            except Exception as e:
-                lines.put(e)
+    def close(self):
+        with self.lock:
+            self._close_locked()
 
-        threading.Thread(target=_reader, daemon=True).start()
-        deadline = time.monotonic() + float(timeout)
-        responses = {}
-        while time.monotonic() < deadline and not (2 in responses and 3 in responses):
-            remaining = max(0.0, deadline - time.monotonic())
-            try:
-                item = lines.get(timeout=min(0.05, remaining))
-            except queue.Empty:
-                if proc.poll() is not None:
-                    break
-                continue
-            if isinstance(item, Exception):
-                raise item
-            try:
-                msg = json.loads(item)
-            except Exception:
-                continue
-            msg_id = msg.get("id")
-            if msg_id in (1, 2, 3):
-                responses[msg_id] = msg
-        if not (2 in responses and 3 in responses):
-            print("codex_monitor: rate rpc timed out or returned incomplete responses", file=sys.stderr)
-            return None
+    def fetch_rate(self, timeout=10):
+        with self.lock:
+            self._connect_locked(timeout)
+            rate_id = self._send_locked("account/rateLimits/read", {})
+            account_id = self._send_locked("account/read", {})
+            responses = self._read_responses_locked({rate_id, account_id}, timeout)
 
-        rate_result = (responses[2].get("result") or {})
+        rate_result = (responses[rate_id].get("result") or {})
         rate_limits = rate_result.get("rateLimits") or {}
         primary = _rpc_window_rate(rate_limits, 300)
         secondary = _rpc_window_rate(rate_limits, 10080)
         if primary is None or secondary is None:
-            print("codex_monitor: rate rpc response missing expected rate windows", file=sys.stderr)
-            return None
-        account = ((responses[3].get("result") or {}).get("account") or {})
+            raise RuntimeError("rate rpc response missing expected rate windows")
+        account = ((responses[account_id].get("result") or {}).get("account") or {})
         credits = rate_limits.get("credits") or {}
         return {
             "primary_pct": float(primary[0]),
@@ -761,10 +733,72 @@ def fetch_rate_via_rpc(timeout=10):
             "credits_balance": credits.get("balance"),
             "fetched_at": time.time(),
         }
-    except Exception as e:
-        print(f"codex_monitor: rate rpc failed: {e}", file=sys.stderr)
-        return None
-    finally:
+
+    def _connect_locked(self, timeout):
+        if self.is_alive():
+            return
+        self._close_locked()
+        self.lines = queue.Queue()
+        self.proc = subprocess.Popen([self.codex_bin, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1,
+                                     start_new_session=True)
+        threading.Thread(target=self._reader, args=(self.proc, self.lines),
+                         name="codex-rate-rpc-reader", daemon=True).start()
+        init_id = self._send_locked("initialize", {"clientInfo": {"name": "codex-wire", "version": self.version}})
+        self._read_responses_locked({init_id}, timeout)
+
+    def _reader(self, proc, lines):
+        try:
+            for line in proc.stdout:
+                lines.put(line)
+        except Exception as e:
+            lines.put(e)
+        finally:
+            lines.put(None)
+
+    def _send_locked(self, method, params):
+        if not self.is_alive() or not self.proc.stdin:
+            raise BrokenPipeError("rate rpc app-server is not connected")
+        req_id = self.next_id
+        self.next_id += 1
+        req = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
+        self.proc.stdin.write(json.dumps(req, separators=(",", ":")) + "\n")
+        self.proc.stdin.flush()
+        return req_id
+
+    def _read_responses_locked(self, wanted_ids, timeout):
+        deadline = time.monotonic() + float(timeout)
+        responses = {}
+        while time.monotonic() < deadline and not wanted_ids.issubset(responses):
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                item = self.lines.get(timeout=min(0.05, remaining))
+            except queue.Empty:
+                if not self.is_alive():
+                    break
+                continue
+            if item is None:
+                raise EOFError("rate rpc app-server stdout closed")
+            if isinstance(item, Exception):
+                raise item
+            try:
+                msg = json.loads(item)
+            except Exception as e:
+                raise ValueError(f"rate rpc returned invalid JSON: {e}")
+            msg_id = msg.get("id")
+            if msg_id in wanted_ids:
+                if msg.get("error"):
+                    raise RuntimeError(f"rate rpc returned error for id {msg_id}: {msg.get('error')}")
+                responses[msg_id] = msg
+        if not wanted_ids.issubset(responses):
+            missing = ",".join(str(i) for i in sorted(wanted_ids - set(responses)))
+            raise TimeoutError(f"rate rpc timed out or returned incomplete responses; missing id(s): {missing}")
+        return responses
+
+    def _close_locked(self):
+        proc = self.proc
+        self.proc = None
+        self.lines = None
         if proc is not None:
             try:
                 if proc.stdin:
@@ -773,14 +807,65 @@ def fetch_rate_via_rpc(timeout=10):
                 pass
             try:
                 if proc.poll() is None:
-                    proc.kill()
+                    os.killpg(proc.pid, signal.SIGTERM)
                 proc.wait(timeout=2)
             except Exception:
                 try:
-                    proc.kill()
+                    if proc.poll() is None:
+                        os.killpg(proc.pid, signal.SIGKILL)
                     proc.wait(timeout=2)
                 except Exception:
-                    pass
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            try:
+                if proc.stdout:
+                    proc.stdout.close()
+            except Exception:
+                pass
+
+
+def _get_rate_rpc_client():
+    global _RPC_RATE_CLIENT
+    old_client = None
+    with _RPC_RATE_CLIENT_LOCK:
+        if _RPC_RATE_CLIENT is not None and _RPC_RATE_CLIENT.is_alive():
+            return _RPC_RATE_CLIENT
+        if _RPC_RATE_CLIENT is not None:
+            old_client = _RPC_RATE_CLIENT
+            _RPC_RATE_CLIENT = None
+        codex_bin = _codex_rpc_bin()
+        if not codex_bin:
+            return None
+        _RPC_RATE_CLIENT = _RateRpcClient(codex_bin, APP_VERSION)
+        client = _RPC_RATE_CLIENT
+    if old_client is not None:
+        old_client.close()
+    return client
+
+
+def _discard_rate_rpc_client(client):
+    global _RPC_RATE_CLIENT
+    if client is None:
+        return
+    with _RPC_RATE_CLIENT_LOCK:
+        if _RPC_RATE_CLIENT is client:
+            _RPC_RATE_CLIENT = None
+    client.close()
+
+
+def fetch_rate_via_rpc(timeout=10):
+    client = _get_rate_rpc_client()
+    if client is None:
+        print("codex_monitor: rate rpc unavailable; codex binary not found", file=sys.stderr)
+        return None
+    try:
+        return client.fetch_rate(timeout=timeout)
+    except Exception as e:
+        _discard_rate_rpc_client(client)
+        print(f"codex_monitor: rate rpc failed: {e}", file=sys.stderr)
+        return None
 
 
 def _set_rpc_rate_cache(data):
