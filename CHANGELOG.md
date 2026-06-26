@@ -8,6 +8,20 @@ for 0.x releases.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-26
+
+### Added
+
+- Added the `today_hours` and `today_date` fields to the `/api` snapshot for server-local session timeline rendering.
+- Added a Sessions today microbar with current-hour indicator, 4-hour scale labels, server-local date display, and per-hour hover tooltips.
+- Added an 80-cap Wire feed donut gauge with warning color above 85% capacity.
+- Added current Rate account and plan display in the Rate card.
+
+### Changed
+
+- Replaced the Live card's single on-air dot with a stacked frosted-glass plate visualization that scales with the number of running agents.
+- Updated the Live stack layout so active-agent plates accumulate from the left and expand across the card area, with capped overflow labeling and an idle plate state.
+
 ## [0.4.0] - 2026-06-26
 
 ### Added
@@ -119,7 +133,8 @@ for 0.x releases.
 
 - Removed internal improvement notes from the public tree.
 
-[Unreleased]: https://github.com/part3917/codex-wire/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/part3917/codex-wire/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/part3917/codex-wire/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/part3917/codex-wire/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/part3917/codex-wire/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/part3917/codex-wire/compare/v0.1.0...v0.2.0

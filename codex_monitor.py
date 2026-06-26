@@ -56,7 +56,7 @@ def _load_monitor_env():
 _load_monitor_env()
 
 PORT = 8787
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 SESS = os.path.expanduser(os.environ.get("CODEX_MONITOR_SESS_DIR", "~/.codex/sessions"))
 HOME = os.path.expanduser("~")
 
@@ -75,6 +75,7 @@ SESSION_LIMIT = _env_int("CODEX_MONITOR_SESSION_LIMIT", 80)
 RECENT_LIMIT = _env_int("CODEX_MONITOR_RECENT_LIMIT", 50)
 ACTIVE_STALE_SEC = _env_int("CODEX_MONITOR_STALE_SEC", 120)
 FEED_WINDOW_SEC = _env_int("CODEX_MONITOR_FEED_WINDOW_SEC", 1800)
+FEED_CAP = 80
 LONG_OP_GRACE_SEC = _env_int("CODEX_MONITOR_LONG_OP_GRACE_SEC", 180)
 TRACK_PATH = os.path.expanduser(os.environ.get("CODEX_MONITOR_TRACK_PATH", "~/.codex/codex_wire_jobs.json"))
 TRACK_TTL_SEC = _env_int("CODEX_MONITOR_TRACK_TTL_SEC", 7 * 24 * 3600)
@@ -1836,6 +1837,28 @@ def cost_series(now):
     return out
 
 
+_ROLLOUT_HOUR_RE = re.compile(r"^rollout-\d{4}-\d{2}-\d{2}T(\d{2})-\d{2}-\d{2}")
+
+
+def _session_hour_buckets(paths):
+    hours = [0] * 24
+    for path in paths:
+        hour = None
+        m = _ROLLOUT_HOUR_RE.search(os.path.basename(path))
+        if m:
+            try:
+                hour = int(m.group(1))
+            except Exception:
+                hour = None
+        if hour is None or not (0 <= hour <= 23):
+            try:
+                hour = time.localtime(os.path.getmtime(path)).tm_hour
+            except Exception:
+                continue
+        hours[hour] += 1
+    return hours
+
+
 def snapshot():
     now = time.time()
     jobs = running_jobs()
@@ -1870,7 +1893,7 @@ def snapshot():
             for e in s["events"]:
                 feed.append({**e, "src": tag})
     feed.sort(key=lambda e: e.get("ts") or "", reverse=True)
-    feed = feed[:80]
+    feed = feed[:FEED_CAP]
 
     recent = []
     running_session_ids = {id(j.get("session")) for j in jobs if j.get("session")}
@@ -1893,11 +1916,13 @@ def snapshot():
     recent = recent[:RECENT_LIMIT]
 
     today = time.strftime("%Y/%m/%d")
+    today_date = f"{today[5:7]}/{today[8:10]} ({('월','화','수','목','금','토','일')[time.localtime().tm_wday]})"
     try:
         today_files = glob.glob(os.path.join(SESS, today, "*.jsonl"))
     except Exception:
         today_files = []
     today_n = len(today_files)
+    today_hours = _session_hour_buckets(today_files)
     today_sessions = _parse_session_files(sorted(today_files, key=_mtime, reverse=True))
     rpc_rate = _active_rpc_rate(now)
     if rpc_rate:
@@ -1929,7 +1954,8 @@ def snapshot():
     source_degraded = _ps_source_degraded()
     source_degraded.update(_storage_degraded())
     return {"ts": time.strftime("%H:%M:%S"), "date": time.strftime("%a %d %b %Y").upper(),
-            "count": len(running), "today": today_n, "rate": rate, "rate7d": rate7d,
+            "count": len(running), "today": today_n, "today_date": today_date,
+            "today_hours": today_hours, "rate": rate, "rate7d": rate7d,
             "rate_resets_at": rate_resets_at, "rate7d_resets_at": rate7d_resets_at,
             "rate_account": rate_account, "rate_plan": rate_plan, "rate_source": rate_source,
             "stale_sec": ACTIVE_STALE_SEC, "status_counts": status_counts,
@@ -1962,6 +1988,7 @@ def _snapshot_shape(data):
     }
     data.setdefault("count", len(data["running"]))
     data.setdefault("today", 0)
+    data.setdefault("today_date", time.strftime("%m/%d") + f" ({('월','화','수','목','금','토','일')[time.localtime().tm_wday]})")
     data.setdefault("rate", None)
     data.setdefault("rate7d", None)
     data.setdefault("rate_resets_at", None)
@@ -2215,17 +2242,61 @@ body.offline{filter:saturate(.4)}
 .stat:last-child{border-right:0}
 .stat .l{font-family:"Saira Condensed",sans-serif;text-transform:uppercase;letter-spacing:.24em;
   font-size:10px;color:var(--dim);margin-bottom:5px}
+.stat-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px}
+.stat-head .l{margin-bottom:0}
 .stat .v{font-family:"Bodoni Moda",serif;font-size:30px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1;color:#2a1d10}
 .stat .v small{font-size:13px;color:var(--dim);font-family:"JetBrains Mono",monospace}
+.live-row{display:flex;align-items:center;justify-content:flex-start;gap:8px;min-height:48px}
+.live-row .v{flex:0 0 auto;min-width:34px}
+.agent-stack-wrap{flex:1 1 auto;min-width:58px;max-width:none;height:48px;display:flex;align-items:center;justify-content:flex-start;margin-top:-1px}
+.agent-stack{position:relative;width:100%;height:48px;overflow:visible;isolation:isolate}
+.agent-plate{position:absolute;top:2px;left:0;width:26px;height:44px;border-radius:50%;
+  border:1px solid rgba(255,255,255,.12);
+  background:rgba(207,89,21,.34);
+  box-shadow:0 2px 6px rgba(42,29,16,.06);
+  backdrop-filter:blur(7px) saturate(1.25);-webkit-backdrop-filter:blur(7px) saturate(1.25);transform:rotate(-15deg) translateY(5px) scale(.92);
+  transform-origin:center;opacity:0;transition:left .28s ease,opacity .28s ease,transform .28s ease,filter .28s ease}
+.agent-plate:after{content:none}
+.agent-plate.live{transform:rotate(-15deg) translateY(0) scale(1)}
+.agent-plate.idle-plate{border-color:rgba(255,255,255,.10);background:rgba(207,89,21,.20);box-shadow:none;opacity:.5}
+.agent-plus{position:absolute;top:18px;left:0;color:var(--dim);font:700 10px/1 "JetBrains Mono",monospace;font-variant-numeric:tabular-nums;letter-spacing:0}
+.stat-micro{margin-top:8px}
+.hour-bars{height:15px;display:flex;align-items:flex-end;gap:2px;position:relative}
+.hour-bars i{flex:1;min-width:2px;height:2px;background:var(--wire);opacity:.24;transition:height .35s ease,opacity .2s ease,background-color .2s ease}
+.hour-bars i.on{opacity:.68}
+.hour-bars i.now{background:var(--ember);opacity:1;box-shadow:0 0 0 1px rgba(42,29,16,.2)}
+.hour-scale{height:10px;position:relative;margin-top:2px;
+  color:var(--dim);font:500 9px/10px "JetBrains Mono",monospace;font-variant-numeric:tabular-nums}
+.hour-scale span{position:absolute;top:0;transform:translateX(-50%);opacity:.78}
+.hour-scale .h0{left:0}.hour-scale .h4{left:16.6667%}.hour-scale .h8{left:33.3333%}
+.hour-scale .h12{left:50%}.hour-scale .h16{left:66.6667%}.hour-scale .h20{left:83.3333%}
+.hour-tip{position:absolute;z-index:80;left:0;top:0;padding:3px 6px;border:1px solid rgba(241,231,210,.22);border-radius:4px;
+  background:rgba(42,29,16,.94);color:var(--ink);font:600 10px/1 "JetBrains Mono",monospace;font-variant-numeric:tabular-nums;
+  white-space:nowrap;box-shadow:0 6px 18px rgba(42,29,16,.18);pointer-events:none;opacity:0;visibility:hidden;
+  transform:translate(-50%,-100%);transition:opacity .12s ease,transform .12s ease,visibility .12s ease}
+.hour-tip.show{opacity:1;visibility:visible;transform:translate(-50%,-116%)}
+.feed-row{display:flex;align-items:center;justify-content:space-between;gap:14px;min-height:48px}
+.feed-row .v{flex:1;min-width:0}
+.feed-ring{display:flex;flex:0 0 auto;flex-direction:column;align-items:center;justify-content:center;gap:3px;margin-top:-1px}
+.feed-ring svg{width:48px;height:48px;overflow:visible}
+.ring-track{fill:none;stroke:#ddcba8;stroke-width:4.5;opacity:.78}
+.ring-progress{fill:none;stroke:var(--wire);stroke-width:4.5;stroke-linecap:butt;transform:rotate(-90deg);
+  transform-origin:50% 50%;stroke-dasharray:100;stroke-dashoffset:100;transition:stroke-dashoffset .6s ease,stroke .2s ease}
+.ring-progress.rate-ok{stroke:var(--wire)}
+.ring-progress.rate-warn{stroke:var(--warn)}
+.mini-cap{color:var(--dim);font:500 10px "JetBrains Mono",monospace;font-variant-numeric:tabular-nums}
 .onair{display:inline-flex;align-items:center;gap:9px}
 .lamp{width:11px;height:11px;border-radius:50%;background:#c3ad81}
 .lamp.on{background:var(--ember);animation:pulse 1.5s infinite}
 .lamp.bad{background:var(--bad);animation:badpulse 1.15s infinite}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(207,89,21,.55)}70%{box-shadow:0 0 0 11px rgba(207,89,21,0)}100%{box-shadow:0 0 0 0 rgba(207,89,21,0)}}
 @keyframes badpulse{0%{box-shadow:0 0 0 0 rgba(169,54,34,.5)}70%{box-shadow:0 0 0 11px rgba(169,54,34,0)}100%{box-shadow:0 0 0 0 rgba(169,54,34,0)}}
-.rate-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px}
+.rate-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:4px}
 .rate-head .l{margin-bottom:0}
-.rate-resets{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dim);
+.rate-label{min-width:0}
+.rate-account{display:none;margin-top:2px;max-width:86px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dim);
+  font:500 10px "JetBrains Mono",monospace;letter-spacing:0;text-transform:none}
+.rate-resets,.stat-date{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dim);
   font:500 11px "JetBrains Mono",monospace;letter-spacing:0;text-transform:none}
 .rate-lines{display:grid;gap:5px}
 .rate-line{display:grid;grid-template-columns:28px 42px minmax(56px,1fr);align-items:center;gap:7px}
@@ -2233,7 +2304,7 @@ body.offline{filter:saturate(.4)}
 .rate-val{font:700 16px "JetBrains Mono",monospace;font-variant-numeric:tabular-nums;color:#2a1d10;line-height:1}
 .rate-val small{font-size:10px;color:var(--dim);font-weight:500}
 .rate-line .gauge{height:4px;margin:0;min-width:0}
-@media(max-width:640px){.rate-line{grid-template-columns:24px 38px minmax(42px,1fr);gap:5px}.rate-resets{font-size:10px}}
+@media(max-width:640px){.rate-line{grid-template-columns:24px 38px minmax(42px,1fr);gap:5px}.rate-resets,.stat-date{font-size:10px}.rate-account{max-width:72px}}
 .gauge{height:5px;background:#ddcba8;margin-top:9px;overflow:hidden}
 .gauge i{display:block;height:100%;background:var(--wire);transition:width .6s,background-color .2s}
 .gauge i.rate-ok{background:var(--wire)}
@@ -2501,16 +2572,16 @@ footer{margin-top:40px;color:var(--faint);font-size:10.5px;border-top:1px solid 
 <div id=wirebanner class=wirebanner role=alert aria-live=assertive aria-atomic=true></div>
 
 <div class=strip>
-  <div class=stat title="running codex processes from ps"><div class=l>Live</div><div class=v id=s_run>—</div></div>
-  <div class=stat title="오늘 생성된 codex 세션 파일 수"><div class=l>Sessions today</div><div class=v id=s_today>—</div></div>
+  <div class="stat live-stat" title="running codex processes from ps"><div class=l>Live</div><div class=live-row><div class=v id=s_run>—</div><div class=agent-stack-wrap title="0 live agents"><div id=s_run_stack class=agent-stack role=img aria-label="0 live agents"></div></div></div></div>
+  <div class=stat title="오늘 생성된 codex 세션 파일 수"><div class=stat-head><div class=l>Sessions today</div><div class=stat-date id=s_today_date title="서버 로컬 날짜 기준">--/--</div></div><div class=v id=s_today>—</div><div class="stat-micro hour-bars" id=s_today_hours aria-label="sessions by hour"></div><div class=hour-scale aria-hidden=true><span class=h0>0</span><span class=h4>4</span><span class=h8>8</span><span class=h12>12</span><span class=h16>16</span><span class=h20>20</span></div></div>
   <div class=stat>
-    <div class=rate-head><div class=l>Rate</div><div class=rate-resets id=s_rate_resets>↻ 5h -- · 7d --</div></div>
+    <div class=rate-head><div class=rate-label><div class=l>Rate</div><div class=rate-account id=s_rate_account></div></div><div class=rate-resets id=s_rate_resets>↻ 5h -- · 7d --</div></div>
     <div class=rate-lines>
       <div class=rate-line><span class=rate-tag>5H</span><span class=rate-val id=s_rate_5h>—<small>%</small></span><div class=gauge><i id=s_rate_5h_bar style=width:0%></i></div></div>
       <div class=rate-line><span class=rate-tag>7D</span><span class=rate-val id=s_rate_7d>—<small>%</small></span><div class=gauge><i id=s_rate_7d_bar style=width:0%></i></div></div>
     </div>
   </div>
-  <div class=stat title="feed from sessions active in last 30m, capped at 80 lines"><div class=l>Wire feed</div><div class=v id=s_feed>—</div></div>
+  <div class=stat title="feed from sessions active in last 30m, capped at 80 lines"><div class=l>Wire feed</div><div class=feed-row><div class=v id=s_feed>—</div><div class=feed-ring title="0/80"><svg viewBox="0 0 48 48" aria-hidden=true><circle class=ring-track cx=24 cy=24 r=20></circle><circle id=s_feed_ring class="ring-progress rate-ok" cx=24 cy=24 r=20 pathLength=100></circle></svg><span id=s_feed_cap class=mini-cap>0/80</span></div></div></div>
 </div>
 
 <div class=costwrap id=costwrap>
@@ -2607,6 +2678,7 @@ function normalizeSnapshot(raw){
   d.running=safeArray(d.running);
   d.feed=safeArray(d.feed);
   d.recent=safeArray(d.recent);
+  d.today_hours=safeArray(d.today_hours).slice(0,24);
   d.status_counts=safeObject(d.status_counts);
   d.source_degraded=safeObject(d.source_degraded);
   d.running.forEach((j,i)=>{if(j&&typeof j==='object'&&!stableId(j))j._stable_fallback='idx_'+i;});
@@ -2644,6 +2716,106 @@ function formatRateReset(epoch, withDate=false){
   const hh=String(d.getHours()).padStart(2,'0'), mm=String(d.getMinutes()).padStart(2,'0');
   return withDate?`${d.getMonth()+1}월 ${d.getDate()}일 ${hh}:${mm}`:`${hh}:${mm}`;
 }
+const FEED_CAP=80;
+function renderLiveStat(d, counts){
+  const stack=document.getElementById('s_run_stack'); if(!stack)return;
+  const count=Math.max(0,Math.floor(Number(d&&d.count)||0));
+  const visible=Math.min(count,10), overflow=Math.max(0,count-visible);
+  const label=count===1?'1 live agent':`${count} live agents`;
+  stack.setAttribute('aria-label',label);
+  const wrap=stack.closest('.agent-stack-wrap'); if(wrap)wrap.title=label;
+  const target=visible||1;
+  const fresh=[];
+  let plates=Array.from(stack.querySelectorAll('.agent-plate'));
+  while(plates.length<target){
+    const p=document.createElement('div');
+    p.className='agent-plate';
+    p.style.opacity='0';
+    stack.appendChild(p);
+    plates.push(p);
+    fresh.push(p);
+  }
+  plates.forEach((p,i)=>{if(i>=target)p.remove();});
+  plates=Array.from(stack.querySelectorAll('.agent-plate')).slice(0,target);
+  const W=Math.max(58,stack.clientWidth||stack.getBoundingClientRect().width||146);
+  const plateW=26, plusSpace=overflow>0?24:0;
+  const available=Math.max(0,W-plateW-plusSpace-2);
+  const step=visible>1?Math.min(16,available/(visible-1)):0;
+  plates.forEach((p,i)=>{
+    const x=count>0?i*step:0;
+    const opacity=count===0?'.38':String(Math.min(.96,.70+(i*.03)));
+    p.className='agent-plate'+(count===0?' idle-plate':' live');
+    p.style.left=x.toFixed(2)+'px';
+    p.style.zIndex=String(i+1);
+    p.style.filter='none';
+    if(fresh.includes(p)){
+      p.style.opacity='0';
+      p.style.transform='rotate(-15deg) translateY(5px) scale(.92)';
+      requestAnimationFrame(()=>{p.style.opacity=opacity;p.style.transform='';});
+    }else{
+      p.style.opacity=opacity;
+      p.style.transform='';
+    }
+  });
+  let plus=stack.querySelector('.agent-plus');
+  if(overflow>0){
+    if(!plus){
+      plus=document.createElement('div');
+      plus.className='agent-plus';
+      stack.appendChild(plus);
+    }
+    plus.textContent=`+${overflow}`;
+    const plusX=Math.min(Math.max(0,W-18),((target-1)*step)+plateW+6);
+    plus.style.left=plusX.toFixed(2)+'px';
+  }else if(plus){plus.remove();}
+}
+function renderTodayHours(hours){
+  const el=document.getElementById('s_today_hours'); if(!el)return;
+  const vals=Array.isArray(hours)?hours.slice(0,24).map(v=>Math.max(0,Number(v)||0)):[];
+  while(vals.length<24)vals.push(0);
+  const max=Math.max.apply(null,vals.concat(1)), now=(new Date()).getHours();
+  el.innerHTML=vals.map((v,i)=>{
+    const h=v?Math.max(4,Math.round((v/max)*14)):2;
+    const cls=(v>0?' on':'')+(i===now?' now':'');
+    const label=`${String(i).padStart(2,'0')}:00 · ${v}`;
+    return `<i${cls?` class="${cls.trim()}"`:''} style="height:${h}px" data-hour-tip="${label}" aria-label="${label}"></i>`;
+  }).join('');
+}
+let hourTipEl=null;
+function hourTip(){
+  if(hourTipEl)return hourTipEl;
+  hourTipEl=document.createElement('div');
+  hourTipEl.className='hour-tip';
+  hourTipEl.setAttribute('role','tooltip');
+  document.body.appendChild(hourTipEl);
+  return hourTipEl;
+}
+function moveHourTip(bar){
+  const tip=hourTip(), r=bar.getBoundingClientRect();
+  tip.style.left=(window.scrollX+r.left+r.width/2)+'px';
+  tip.style.top=(window.scrollY+r.top-6)+'px';
+}
+function showHourTip(bar){
+  const tip=hourTip();
+  tip.textContent=bar.dataset.hourTip||'';
+  moveHourTip(bar);
+  tip.classList.add('show');
+}
+function hideHourTip(){if(hourTipEl)hourTipEl.classList.remove('show');}
+document.addEventListener('mouseover',e=>{const bar=e.target.closest&&e.target.closest('#s_today_hours i'); if(bar)showHourTip(bar);});
+document.addEventListener('mousemove',e=>{const bar=e.target.closest&&e.target.closest('#s_today_hours i'); if(bar&&hourTipEl&&hourTipEl.classList.contains('show'))moveHourTip(bar);});
+document.addEventListener('mouseout',e=>{const bar=e.target.closest&&e.target.closest('#s_today_hours i'); if(bar)hideHourTip();});
+function renderFeedGauge(feed){
+  const n=Array.isArray(feed)?feed.length:0, pct=Math.min(100,Math.max(0,n/FEED_CAP*100));
+  const ring=document.getElementById('s_feed_ring');
+  if(ring){
+    ring.style.strokeDashoffset=(100-pct).toFixed(2);
+    ring.classList.remove('rate-ok','rate-warn','rate-bad');
+    ring.classList.add(pct>85?'rate-warn':'rate-ok');
+    const wrap=ring.closest('.feed-ring'); if(wrap)wrap.title=`${n}/${FEED_CAP}`;
+  }
+  setText(document.getElementById('s_feed_cap'),`${n}/${FEED_CAP}`);
+}
 function renderRateLine(value, valueId, barId){
   const n=Number(value), ok=Number.isFinite(n);
   setHTML(document.getElementById(valueId),(ok?Math.round(n):'—')+'<small>%</small>');
@@ -2654,7 +2826,24 @@ function renderRateLine(value, valueId, barId){
   bar.classList.remove('rate-ok','rate-warn','rate-bad');
   if(ok)bar.classList.add(pct>85?'rate-bad':(pct>=70?'rate-warn':'rate-ok'));
 }
+function renderRateAccount(d){
+  const el=document.getElementById('s_rate_account'); if(!el)return;
+  const account=String((d&&d.rate_account)||'').trim();
+  const plan=String((d&&d.rate_plan)||'').trim();
+  if(!account&&!plan){
+    setText(el,'');
+    el.removeAttribute('title');
+    el.style.display='none';
+    return;
+  }
+  const user=account?account.split('@')[0]:plan;
+  const text=plan&&account?`${user} · ${plan}`:user;
+  setText(el,text);
+  el.title=account?(plan?`${account} · ${plan}`:account):plan;
+  el.style.display='block';
+}
 function renderRate(d){
+  renderRateAccount(d);
   renderRateLine(d&&d.rate,'s_rate_5h','s_rate_5h_bar');
   renderRateLine(d&&d.rate7d,'s_rate_7d','s_rate_7d_bar');
   setText(document.getElementById('s_rate_resets'),`↻ 5h ${formatRateReset(d&&d.rate_resets_at)} · 7d ${formatRateReset(d&&d.rate7d_resets_at,true)}`);
@@ -3238,9 +3427,10 @@ async function tick(manual=false){
   document.getElementById('lamp').className=counts.error>0?'lamp bad':('lamp'+(d.count>0?' on':''));
   setText(document.getElementById('onair'),d.count>0?'ON AIR':'STANDBY');
   document.getElementById('onair').style.color=counts.error>0?'var(--bad)':(d.count>0?'var(--ember)':'var(--dim)');
-  setText(document.getElementById('s_run'),d.count); setText(document.getElementById('s_today'),d.today);
+  setText(document.getElementById('s_run'),d.count); safeRender('renderLiveStat',()=>renderLiveStat(d,counts));
+  setText(document.getElementById('s_today'),d.today); setText(document.getElementById('s_today_date'),d.today_date||'--/--'); safeRender('renderTodayHours',()=>renderTodayHours(d.today_hours));
   safeRender('renderRate',()=>renderRate(d));
-  setText(document.getElementById('s_feed'),d.feed.length);
+  setText(document.getElementById('s_feed'),d.feed.length); safeRender('renderFeedGauge',()=>renderFeedGauge(d.feed));
   safeRender('renderCost',()=>renderCost(d));
   safeRender('renderControls',()=>renderControls(d));
   safeRender('renderCards',()=>renderCards());
