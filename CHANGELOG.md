@@ -8,9 +8,50 @@ for 0.x releases.
 
 ## [Unreleased]
 
-### Note
+### Windows
 
-- Windows port (fork of v0.6.0): added Windows README usage notes and PowerShell install, run, and dispatch entrypoints while keeping the dashboard functionality and UI aligned with the upstream macOS project.
+- This branch tracks `main` and adds cross-platform (Windows) support: PowerShell process listing, `CommandLineToArgvW` argv, `OpenProcess`-based liveness, `taskkill`/`CREATE_NEW_PROCESS_GROUP`, `%APPDATA%\npm` codex discovery, `CODEX_HOME`/normcase paths, UTF-8 RPC, and dev/ino-guarded incremental parsing. Synced to v0.10.0. Adds `dispatch.ps1` / `install.ps1` / `run.ps1`. macOS behavior and `/api` output are unchanged.
+
+## [0.10.0] - 2026-06-26
+
+### Performance
+
+- Behavior-preserving optimizations (UI and `/api` output unchanged, verified via golden `/api` and incremental-parse self-tests):
+  - Frontend: skip re-rendering the Stage donut, rate lines, and control selects when their values are unchanged; same-value write guards; build the stage tooltip skeleton once.
+  - Backend snapshot: index running jobs by cwd (O(J·S)→O(S)); count `stage_counts`/`status_counts` in a single pass; lazy lowercasing in `_stage()`; precompiled JSONL regexes; reuse already-parsed session summaries for today's totals; combined output status/message file probe.
+  - Rate RPC: `SimpleQueue` for the reader, removed redundant cache copies, reader-thread join hardening.
+  - Incremental parser: reuse the head signature to avoid a redundant re-read.
+
+## [0.9.1] - 2026-06-26
+
+### Changed
+
+- Stage distribution donut segments now animate smoothly (grow/shrink and shift) on value changes — segment nodes persist and update via `stroke-dasharray`/`stroke-dashoffset` with a CSS transition instead of being rebuilt each tick.
+
+## [0.9.0] - 2026-06-26
+
+### Added
+
+- Added `stage_counts` to the `/api` snapshot, counting running jobs across `reading`, `analyzing`, `editing`, `verifying`, `starting`, and `idle` stages.
+- Added a segmented Stage distribution donut with stage-specific colors, hover tooltips, and a persistent idle track when no jobs are running.
+
+### Changed
+
+- Replaced the top Wire feed stat card with the Stage distribution card while keeping the Live Telegraph feed stream panel unchanged.
+
+## [0.8.0] - 2026-06-26
+
+### Performance
+
+- Added append-only incremental parsing for active session JSONL files, reusing cached parse state when file identity, size growth, and the head signature prove the log only grew.
+- Preserved full reparse fallbacks for truncation, rewrite, head mismatch, malformed or incomplete records, identity changes, and platforms without reliable device/inode identity.
+
+## [0.7.0] - 2026-06-26
+
+### Performance
+
+- Reused a persistent Codex `app-server` connection for live RPC rate-limit refreshes, initializing once per connection and repeating only `account/rateLimits/read` plus `account/read` until EOF, timeout, or failure forces a reconnect.
+- Preserved the existing rate cache across transient RPC failures while retiring broken app-server process groups with `SIGTERM`, `SIGKILL`, and process kill fallback.
 
 ## [0.6.0] - 2026-06-26
 

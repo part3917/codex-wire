@@ -5,16 +5,18 @@ Sources (stdlib only, no deps):
   • `ps`                          → running codex exec jobs (pid, elapsed, cwd, sandbox)
   • ~/.codex/sessions/**/*.jsonl  → live activity: commands, file edits, agent messages, tokens
 """
-import argparse, ctypes, datetime, functools, glob, hashlib, json, math, os, queue, re, secrets, shlex, shutil, signal, socket, struct, subprocess, sys, tempfile, threading, time, urllib.parse
+import argparse, copy, ctypes, datetime, functools, glob, hashlib, json, math, os, queue, re, secrets, shlex, shutil, signal, struct, subprocess, sys, tempfile, threading, time, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 _IS_WIN = (os.name == "nt")
 
 
 def _expand_path(value):
-    return os.path.abspath(os.path.normpath(
-        os.path.expandvars(os.path.expanduser(str(value or "")))
-    ))
+    text = os.path.expanduser(str(value or ""))
+    if _IS_WIN:
+        text = os.path.expandvars(text)
+        return os.path.abspath(os.path.normpath(text))
+    return text
 
 
 def _env_path(name, default):
@@ -25,7 +27,8 @@ def _env_path(name, default):
 def _path_key(path):
     if not path:
         return ""
-    return os.path.normcase(_expand_path(path))
+    p = _expand_path(path)
+    return os.path.normcase(os.path.abspath(os.path.normpath(p))) if _IS_WIN else p
 
 
 def _same_path(a, b):
@@ -81,7 +84,7 @@ def _load_monitor_env():
 _load_monitor_env()
 
 PORT = 8787
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.10.0"
 CODEX_HOME = _env_path("CODEX_HOME", "~/.codex")
 SESS = _env_path("CODEX_MONITOR_SESS_DIR", os.path.join(CODEX_HOME, "sessions"))
 HOME = _expand_path("~")
@@ -102,8 +105,8 @@ RECENT_LIMIT = _env_int("CODEX_MONITOR_RECENT_LIMIT", 50)
 ACTIVE_STALE_SEC = _env_int("CODEX_MONITOR_STALE_SEC", 120)
 FEED_WINDOW_SEC = _env_int("CODEX_MONITOR_FEED_WINDOW_SEC", 1800)
 FEED_CAP = 80
+STAGE_ORDER = ("reading", "analyzing", "editing", "verifying", "starting", "idle")
 LONG_OP_GRACE_SEC = _env_int("CODEX_MONITOR_LONG_OP_GRACE_SEC", 180)
-TRACK_PATH = _env_path("CODEX_MONITOR_TRACK_PATH", os.path.join(CODEX_HOME, "codex_wire_jobs.json"))
 TRACK_TTL_SEC = _env_int("CODEX_MONITOR_TRACK_TTL_SEC", 7 * 24 * 3600)
 
 
@@ -115,6 +118,7 @@ def _default_codex_bin():
     return "~/.npm-global/bin/codex"
 
 
+TRACK_PATH = _env_path("CODEX_MONITOR_TRACK_PATH", os.path.join(CODEX_HOME, "codex_wire_jobs.json"))
 CODEX_BIN = _env_path("CODEX_MONITOR_CODEX_BIN", _default_codex_bin())
 RPC_RATE_REFRESH_SEC = _env_int("CODEX_MONITOR_RPC_RATE_REFRESH_SEC", 45)
 POST_BODY_LIMIT = 256 * 1024
@@ -141,6 +145,8 @@ _STORAGE_HEALTH = {"cost_index_error": "", "cost_index_failed_at": 0.0,
 _STORAGE_HEALTH_LOCK = threading.Lock()
 _RPC_RATE_CACHE = None
 _RPC_RATE_CACHE_LOCK = threading.Lock()
+_RPC_RATE_CLIENT = None
+_RPC_RATE_CLIENT_LOCK = threading.Lock()
 _RPC_RATE_THREAD_STARTED = False
 _LIBC = None
 _LIBC_READY = False
@@ -154,6 +160,8 @@ _EXIT_CODE_RE = re.compile(r"Process exited with code\s+(-?\d+)")
 _STAGE_VERIFY_RE = re.compile(r"\b(test|pytest|lint|build|check|py_compile|tsc|vitest)\b")
 _STAGE_READ_RE = re.compile(r"\b(rg|sed|cat|ls|find|git show|git status|nl|wc)\b")
 _OUTPUT_STATUS_RE = re.compile(r"(?m)^\s*STATUS=(ok|timeout|error)\s*$")
+_WS_RE = re.compile(r"\s+")
+_PATCH_FILE_RE = re.compile(r"[AM]\s+(\S+)")
 _PAGE_HTML_BYTES = None
 _WIN_CMDLINES = {}
 _WIN_CMDLINES_LOCK = threading.Lock()
@@ -199,28 +207,28 @@ def _atomic_json_replace(path, data, *, separators=None):
 
 
 def _short(p):
-    p = str(p or "")
-    if not p:
-        return p
-    try:
-        home_key = _path_key(HOME)
-        p_key = _path_key(p)
-        if p_key == home_key:
-            return "~"
-        prefix = home_key + os.sep
-        if p_key.startswith(prefix):
-            rel = os.path.relpath(_expand_path(p), HOME)
-            return os.path.join("~", rel)
-    except Exception:
-        pass
-    return p
+    if _IS_WIN:
+        p = str(p or "")
+        if not p:
+            return p
+        try:
+            home_key = _path_key(HOME)
+            p_key = _path_key(p)
+            if p_key == home_key:
+                return "~"
+            prefix = home_key + os.sep
+            if p_key.startswith(prefix):
+                rel = os.path.relpath(_expand_path(p), HOME)
+                return os.path.join("~", rel)
+        except Exception:
+            pass
+    return (p or "").replace(HOME, "~")
 
 
 def _path_leaf(path, default="?"):
     text = str(path or "")
     if not text:
         return default
-    text = _short(text)
     leaf = os.path.basename(os.path.normpath(text))
     return leaf or default
 
@@ -232,8 +240,7 @@ def _retry_win_share(fn, attempts=5, delay=0.02):
         except PermissionError as e:
             if not _IS_WIN or i == attempts - 1:
                 raise
-            winerror = getattr(e, "winerror", None)
-            if winerror not in (32, 33):
+            if getattr(e, "winerror", None) not in (32, 33):
                 raise
             time.sleep(delay * (2 ** i))
 
@@ -403,8 +410,7 @@ def _pid_alive(pid):
             if not handle:
                 return False
             try:
-                result = wait(handle, 0)
-                return result == 0x00000102  # WAIT_TIMEOUT means still running.
+                return wait(handle, 0) == 0x00000102  # WAIT_TIMEOUT
             finally:
                 close(handle)
         except Exception:
@@ -570,12 +576,12 @@ def _flag_value(argv, *flags):
 
 
 def _next_flag_index(text):
-    matches = []
+    best = len(text)
     for rx in _NEXT_FLAG_RES:
         m = rx.search(text)
-        if m:
-            matches.append(m.start())
-    return min(matches) if matches else len(text)
+        if m and m.start() < best:
+            best = m.start()
+    return best
 
 
 def _raw_flag_value(args, *flags, want_dir=False):
@@ -638,25 +644,26 @@ def _codex_exec_prompt(argv):
 def _normalize_out(path, cwd=None):
     if not path:
         return None
-    out = os.path.expandvars(os.path.expanduser(str(path)))
+    out = _expand_path(str(path)) if _IS_WIN else os.path.expanduser(str(path))
     if not os.path.isabs(out):
         base = cwd if cwd and os.path.isdir(cwd) else HOME
         out = os.path.join(base, out)
-    return _expand_path(out)
+    return os.path.abspath(out)
 
 
-def _looks_like_codex_exec(args, argv=None):
-    text = str(args or "")
-    if "codex" not in text.lower() or " exec" not in text:
+def _looks_like_codex_exec(args, argv):
+    if not args:
         return False
-    normalized = text.replace("\\", "/").lower()
-    if "/codex" in normalized or "@openai/codex" in normalized or "codex-upstream" in normalized:
-        return True
-    for tok in argv or []:
-        base = os.path.basename(str(tok).replace("\\", "/")).lower()
-        if base in ("codex", "codex.exe", "codex.cmd", "codex.bat", "codex.ps1"):
-            return True
-    return False
+    lower = str(args).replace("\\", "/").lower()
+    if "codex" not in lower or " exec" not in lower:
+        return False
+    if _IS_WIN:
+        for tok in argv or []:
+            leaf = os.path.basename(str(tok).replace("\\", "/")).lower()
+            if leaf in ("codex", "codex.exe", "codex.cmd", "codex.bat", "codex.ps1"):
+                return True
+        return "codex.cmd" in lower or "codex.exe" in lower or "/codex" in lower or "@openai/codex" in lower or "codex-upstream" in lower
+    return "/codex" in args or "@openai/codex" in args or "codex-upstream" in args
 
 
 def running_jobs(use_cache_on_failure=True):
@@ -674,8 +681,6 @@ def running_jobs(use_cache_on_failure=True):
         except ValueError:
             continue
         if "Z" in stat.upper():
-            continue
-        if "codex" not in args or " exec" not in args:
             continue
         if _is_monitor_server(pid, args):
             continue
@@ -700,9 +705,10 @@ def running_jobs(use_cache_on_failure=True):
     return jobs
 
 
-_PARSE_CACHE = {}            # path -> (mtime, size, summary) — skip re-parsing unchanged files
+_PARSE_CACHE = {}            # path -> cache entry; unchanged files skip re-parsing
 _PARSE_CACHE_LOCK = threading.Lock()
 _BIG = 8 * 1024 * 1024       # cache boundary retained; large files stream fully on cache miss
+_PARSE_HEAD_SIG_BYTES = 64 * 1024
 _EVENT_TAIL_MAX = 64
 _OUTPUT_TAIL_MAX = 8
 _ERROR_TAIL_MAX = 8
@@ -721,12 +727,15 @@ def _add_parse_error(parse_errors, msg):
 
 
 def _jsonl_obj(raw, parse_errors=None, complete=None):
-    if not raw or not raw.strip():
+    if not raw:
+        return None
+    stripped = raw.strip()
+    if not stripped:
         return None
     if complete is None:
         complete = raw.endswith(b"\n")
     try:
-        obj = json.loads(raw.strip())
+        obj = json.loads(stripped)
     except Exception as e:
         if not complete:
             return None
@@ -770,7 +779,7 @@ def _epoch(ts):
 
 
 def _event(events, ts, k, t, important=False):
-    t = re.sub(r"\s+", " ", str(t or "")).strip()
+    t = _WS_RE.sub(" ", str(t or "")).strip()
     if t:
         events.append({"ts": ts, "k": k, "t": t[:300], "important": important})
         if len(events) > _EVENT_TAIL_MAX:
@@ -928,58 +937,75 @@ def _latest_active_rates(sessions, now):
 
 
 def _codex_rpc_bin():
-    def usable(path):
-        return bool(path and os.path.isfile(path) and (os.access(path, os.X_OK) or _IS_WIN))
-
-    candidates = [CODEX_BIN]
+    if os.path.exists(CODEX_BIN) and (os.access(CODEX_BIN, os.X_OK) or _IS_WIN):
+        return CODEX_BIN
     if _IS_WIN:
         appdata = os.environ.get("APPDATA")
         if appdata:
-            npm = os.path.join(appdata, "npm")
-            candidates.extend(os.path.join(npm, name) for name in
-                              ("codex.cmd", "codex.exe", "codex.bat", "codex.ps1"))
-        for name in ("codex.exe", "codex.cmd", "codex.bat", "codex"):
-            found = shutil.which(name)
-            if found:
-                candidates.append(found)
+            npm_cmd = os.path.join(appdata, "npm", "codex.cmd")
+            if os.path.isfile(npm_cmd):
+                return npm_cmd
         try:
             proc = subprocess.run(["where.exe", "codex"], capture_output=True, text=True,
                                   encoding="utf-8", errors="replace", timeout=3)
             if proc.returncode == 0:
-                candidates.extend(line.strip() for line in proc.stdout.splitlines() if line.strip())
+                for line in (proc.stdout or "").splitlines():
+                    p = line.strip()
+                    if p and os.path.isfile(p):
+                        return p
         except Exception:
             pass
-    else:
-        candidates.append(shutil.which("codex"))
-    seen = set()
-    for path in candidates:
-        if not path:
-            continue
-        key = _path_key(path)
-        if key in seen:
-            continue
-        seen.add(key)
-        if usable(path):
-            return path
-    return None
+        for ext in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";"):
+            p = shutil.which("codex" + ext.lower()) or shutil.which("codex" + ext.upper())
+            if p:
+                return p
+    return shutil.which("codex")
 
 
-def _win_creationflags():
-    return getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if _IS_WIN else 0
-
-
-def _terminate_process_tree(pid):
+def _rpc_popen_kwargs():
+    kwargs = {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.DEVNULL,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "bufsize": 1,
+    }
     if _IS_WIN:
-        try:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(int(pid))],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kwargs["start_new_session"] = True
+    return kwargs
+
+
+def _taskkill_tree(pid):
+    try:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(int(pid))],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+def _terminate_rate_rpc_proc(proc, *, force=False):
+    if proc is None or proc.poll() is not None:
+        return
+    if _IS_WIN:
+        if _taskkill_tree(proc.pid):
             return
+        try:
+            proc.kill()
         except Exception:
             pass
+        return
     try:
-        os.kill(int(pid), signal.SIGTERM)
+        os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
     except Exception:
-        pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
 def _rpc_window_rate(rate_limits, window_mins):
@@ -996,67 +1022,37 @@ def _rpc_window_rate(rate_limits, window_mins):
     return None
 
 
-def fetch_rate_via_rpc(timeout=10):
-    codex_bin = _codex_rpc_bin()
-    if not codex_bin:
-        print("codex_monitor: rate rpc unavailable; codex binary not found", file=sys.stderr)
-        return None
-    proc = None
-    try:
-        proc = subprocess.Popen([codex_bin, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
-                                errors="replace", bufsize=1, creationflags=_win_creationflags())
-        requests = [
-            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-             "params": {"clientInfo": {"name": "codex-wire", "version": APP_VERSION}}},
-            {"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read", "params": {}},
-            {"jsonrpc": "2.0", "id": 3, "method": "account/read", "params": {}},
-        ]
-        for req in requests:
-            proc.stdin.write(json.dumps(req, separators=(",", ":")) + "\n")
-        proc.stdin.flush()
+class _RateRpcClient:
+    def __init__(self, codex_bin, version):
+        self.codex_bin = codex_bin
+        self.version = version
+        self.proc = None
+        self.lines = None
+        self.reader_thread = None
+        self.next_id = 1
+        self.lock = threading.Lock()
 
-        lines = queue.Queue()
+    def is_alive(self):
+        return self.proc is not None and self.proc.poll() is None
 
-        def _reader():
-            try:
-                for line in proc.stdout:
-                    lines.put(line)
-            except Exception as e:
-                lines.put(e)
+    def close(self):
+        with self.lock:
+            self._close_locked()
 
-        threading.Thread(target=_reader, daemon=True).start()
-        deadline = time.monotonic() + float(timeout)
-        responses = {}
-        while time.monotonic() < deadline and not (2 in responses and 3 in responses):
-            remaining = max(0.0, deadline - time.monotonic())
-            try:
-                item = lines.get(timeout=min(0.05, remaining))
-            except queue.Empty:
-                if proc.poll() is not None:
-                    break
-                continue
-            if isinstance(item, Exception):
-                raise item
-            try:
-                msg = json.loads(item)
-            except Exception:
-                continue
-            msg_id = msg.get("id")
-            if msg_id in (1, 2, 3):
-                responses[msg_id] = msg
-        if not (2 in responses and 3 in responses):
-            print("codex_monitor: rate rpc timed out or returned incomplete responses", file=sys.stderr)
-            return None
+    def fetch_rate(self, timeout=10):
+        with self.lock:
+            self._connect_locked(timeout)
+            rate_id = self._send_locked("account/rateLimits/read", {})
+            account_id = self._send_locked("account/read", {})
+            responses = self._read_responses_locked({rate_id, account_id}, timeout)
 
-        rate_result = (responses[2].get("result") or {})
+        rate_result = (responses[rate_id].get("result") or {})
         rate_limits = rate_result.get("rateLimits") or {}
         primary = _rpc_window_rate(rate_limits, 300)
         secondary = _rpc_window_rate(rate_limits, 10080)
         if primary is None or secondary is None:
-            print("codex_monitor: rate rpc response missing expected rate windows", file=sys.stderr)
-            return None
-        account = ((responses[3].get("result") or {}).get("account") or {})
+            raise RuntimeError("rate rpc response missing expected rate windows")
+        account = ((responses[account_id].get("result") or {}).get("account") or {})
         credits = rate_limits.get("credits") or {}
         return {
             "primary_pct": float(primary[0]),
@@ -1068,10 +1064,73 @@ def fetch_rate_via_rpc(timeout=10):
             "credits_balance": credits.get("balance"),
             "fetched_at": time.time(),
         }
-    except Exception as e:
-        print(f"codex_monitor: rate rpc failed: {e}", file=sys.stderr)
-        return None
-    finally:
+
+    def _connect_locked(self, timeout):
+        if self.is_alive():
+            return
+        self._close_locked()
+        self.lines = queue.SimpleQueue()
+        self.proc = subprocess.Popen([self.codex_bin, "app-server"], **_rpc_popen_kwargs())
+        self.reader_thread = threading.Thread(target=self._reader, args=(self.proc, self.lines),
+                                              name="codex-rate-rpc-reader", daemon=True)
+        self.reader_thread.start()
+        init_id = self._send_locked("initialize", {"clientInfo": {"name": "codex-wire", "version": self.version}})
+        self._read_responses_locked({init_id}, timeout)
+
+    def _reader(self, proc, lines):
+        try:
+            for line in proc.stdout:
+                lines.put(line)
+        except Exception as e:
+            lines.put(e)
+        finally:
+            lines.put(None)
+
+    def _send_locked(self, method, params):
+        if not self.is_alive() or not self.proc.stdin:
+            raise BrokenPipeError("rate rpc app-server is not connected")
+        req_id = self.next_id
+        self.next_id += 1
+        req = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
+        self.proc.stdin.write(json.dumps(req, separators=(",", ":")) + "\n")
+        self.proc.stdin.flush()
+        return req_id
+
+    def _read_responses_locked(self, wanted_ids, timeout):
+        deadline = time.monotonic() + float(timeout)
+        responses = {}
+        while time.monotonic() < deadline and not wanted_ids.issubset(responses):
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                item = self.lines.get(timeout=min(0.05, remaining))
+            except queue.Empty:
+                if not self.is_alive():
+                    break
+                continue
+            if item is None:
+                raise EOFError("rate rpc app-server stdout closed")
+            if isinstance(item, Exception):
+                raise item
+            try:
+                msg = json.loads(item)
+            except Exception as e:
+                raise ValueError(f"rate rpc returned invalid JSON: {e}")
+            msg_id = msg.get("id")
+            if msg_id in wanted_ids:
+                if msg.get("error"):
+                    raise RuntimeError(f"rate rpc returned error for id {msg_id}: {msg.get('error')}")
+                responses[msg_id] = msg
+        if not wanted_ids.issubset(responses):
+            missing = ",".join(str(i) for i in sorted(wanted_ids - set(responses)))
+            raise TimeoutError(f"rate rpc timed out or returned incomplete responses; missing id(s): {missing}")
+        return responses
+
+    def _close_locked(self):
+        proc = self.proc
+        reader_thread = self.reader_thread
+        self.proc = None
+        self.lines = None
+        self.reader_thread = None
         if proc is not None:
             try:
                 if proc.stdin:
@@ -1080,18 +1139,70 @@ def fetch_rate_via_rpc(timeout=10):
                 pass
             try:
                 if proc.poll() is None:
-                    _terminate_process_tree(proc.pid)
-                    if proc.poll() is None:
-                        proc.kill()
+                    _terminate_rate_rpc_proc(proc, force=False)
                 proc.wait(timeout=2)
             except Exception:
                 try:
-                    _terminate_process_tree(proc.pid)
                     if proc.poll() is None:
-                        proc.kill()
+                        _terminate_rate_rpc_proc(proc, force=True)
                     proc.wait(timeout=2)
                 except Exception:
-                    pass
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            try:
+                if proc.stdout:
+                    proc.stdout.close()
+            except Exception:
+                pass
+        if reader_thread is not None and reader_thread is not threading.current_thread():
+            try:
+                reader_thread.join(timeout=0.15)
+            except Exception:
+                pass
+
+
+def _get_rate_rpc_client():
+    global _RPC_RATE_CLIENT
+    old_client = None
+    with _RPC_RATE_CLIENT_LOCK:
+        if _RPC_RATE_CLIENT is not None and _RPC_RATE_CLIENT.is_alive():
+            return _RPC_RATE_CLIENT
+        if _RPC_RATE_CLIENT is not None:
+            old_client = _RPC_RATE_CLIENT
+            _RPC_RATE_CLIENT = None
+        codex_bin = _codex_rpc_bin()
+        if not codex_bin:
+            return None
+        _RPC_RATE_CLIENT = _RateRpcClient(codex_bin, APP_VERSION)
+        client = _RPC_RATE_CLIENT
+    if old_client is not None:
+        old_client.close()
+    return client
+
+
+def _discard_rate_rpc_client(client):
+    global _RPC_RATE_CLIENT
+    if client is None:
+        return
+    with _RPC_RATE_CLIENT_LOCK:
+        if _RPC_RATE_CLIENT is client:
+            _RPC_RATE_CLIENT = None
+    client.close()
+
+
+def fetch_rate_via_rpc(timeout=10):
+    client = _get_rate_rpc_client()
+    if client is None:
+        print("codex_monitor: rate rpc unavailable; codex binary not found", file=sys.stderr)
+        return None
+    try:
+        return client.fetch_rate(timeout=timeout)
+    except Exception as e:
+        _discard_rate_rpc_client(client)
+        print(f"codex_monitor: rate rpc failed: {e}", file=sys.stderr)
+        return None
 
 
 def _set_rpc_rate_cache(data):
@@ -1100,12 +1211,12 @@ def _set_rpc_rate_cache(data):
         return None
     with _RPC_RATE_CACHE_LOCK:
         _RPC_RATE_CACHE = dict(data)
-        return dict(_RPC_RATE_CACHE)
+        return _RPC_RATE_CACHE
 
 
 def _get_rpc_rate_cache():
     with _RPC_RATE_CACHE_LOCK:
-        return dict(_RPC_RATE_CACHE) if _RPC_RATE_CACHE else None
+        return _RPC_RATE_CACHE
 
 
 def _active_rpc_rate(now):
@@ -1144,13 +1255,27 @@ def start_rate_rpc_refresher():
     threading.Thread(target=_rpc_rate_refresh_loop, name="codex-rate-rpc", daemon=True).start()
 
 
-def parse_session(path, st=None):
-    """Extract a rich summary + event stream from one rollout jsonl."""
-    if st is None:
-        try:
-            st = os.stat(path)
-        except OSError:
-            return None
+def _stat_identity(st):
+    if _IS_WIN:
+        return None
+    try:
+        dev, ino = int(st.st_dev), int(st.st_ino)
+    except Exception:
+        return None
+    if not dev or not ino:
+        return None
+    return dev, ino
+
+
+def _head_signature(path, limit=_PARSE_HEAD_SIG_BYTES):
+    try:
+        with _open_read_binary(path) as fh:
+            return hashlib.sha256(fh.read(limit)).hexdigest()
+    except Exception:
+        return None
+
+
+def _new_parse_state(path, st):
     s = {"file": path, "cwd": "", "prompt": "", "n_cmds": 0, "n_edits": 0,
          "files": [], "last_cmd": "", "last_msg": "", "rate_pct": None,
          "rate_primary": None, "rate_secondary": None,
@@ -1160,92 +1285,130 @@ def parse_session(path, st=None):
          "events": [], "model": "", "outputs": [], "errors": [],
          "truncated": False,
          "tokens": {"input": 0, "cached": 0, "output": 0, "reasoning": 0, "total": 0, "cost": 0.0}}
-    files, exec_calls, parse_errors = set(), {}, []
-    for o in _iter(path, st.st_size, parse_errors):
-        try:
-            if not isinstance(o, dict):
-                continue
-            p = o.get("payload", {}) or {}
-            if not isinstance(p, dict):
-                _add_parse_error(parse_errors, "jsonl schema: payload is not an object")
-                continue
-            ts = o.get("timestamp", "")
-            ets = _epoch(ts)
-            if ets:
-                s["last_ts"] = max(s["last_ts"], ets)
-                if s["last_event_epoch"] is None or ets > s["last_event_epoch"]:
-                    s["last_event_epoch"] = ets
-                    s["last_event_ts"] = ts
-            otype, ptype = o.get("type"), p.get("type", "")
-            if otype == "session_meta" or ("cwd" in p and not s["cwd"]):
-                s["cwd"] = p.get("cwd", s["cwd"]); s["model"] = (p.get("model") or o.get("model") or s["model"])
-            elif ptype == "task_started":
-                s["started"] = p.get("started_at"); s["ctx_window"] = p.get("model_context_window")
-            elif ptype == "user_message":
-                s["prompt"] = (p.get("message") or "")[:5000]
-            elif ptype == "agent_message":
-                m = (p.get("message") or "").strip()
-                if m:
-                    s["last_msg"] = m
-                    _event(s["events"], ts, "msg", m, True)
-            elif ptype == "function_call" and p.get("name") == "exec_command":
-                try:
-                    args = json.loads(p.get("arguments", "{}"))
-                    cmd = args.get("cmd", "")
-                except Exception:
-                    cmd = p.get("arguments", "")
-                cmd = re.sub(r"\s+", " ", str(cmd)).strip()
-                if cmd:
-                    s["n_cmds"] += 1; s["last_cmd"] = cmd
-                    if p.get("call_id"):
-                        exec_calls[p.get("call_id")] = {"cmd": cmd, "ts": ts, "epoch": ets}
-                    _event(s["events"], ts, "cmd", cmd[:240], False)
-            elif ptype == "function_call_output":
-                out = str(p.get("output", ""))
-                call_id = p.get("call_id")
-                call = exec_calls.pop(call_id, None) if call_id else None
-                if call or out.startswith("Chunk ID:"):
-                    code = _exit_code(out)
-                    cmd = (call or {}).get("cmd") if isinstance(call, dict) else (call or s["last_cmd"])
-                    entry = {"ts": ts, "cmd": cmd, "exit_code": code, "output": _trim_output(out)}
-                    s["outputs"].append(entry)
-                    _trim_tail_in_place(s["outputs"], _OUTPUT_TAIL_MAX)
-                    if code not in (None, 0):
-                        err = _error_entry(ts, entry["cmd"], code, entry["output"])
-                        s["errors"].append(err)
-                        _trim_tail_in_place(s["errors"], _ERROR_TAIL_MAX)
-                        _event(s["events"], ts, "err", f"{err['label']}: {entry['cmd']}", True)
-                    else:
-                        _event(s["events"], ts, "out", entry["cmd"], False)
-            elif ptype == "custom_tool_call" and p.get("name") == "apply_patch":
-                s["n_edits"] += 1
-                _event(s["events"], ts, "edit", "apply_patch", True)
-            elif ptype == "custom_tool_call_output":
-                output = str(p.get("output", ""))
-                for m in re.finditer(r"[AM]\s+(\S+)", output):
-                    files.add(os.path.basename(m.group(1)))
-                if "error" in output.lower() or "failed" in output.lower():
-                    err = _error_entry(ts, "apply_patch", None, output)
+    return {"summary": s, "files": set(), "exec_calls": {}, "parse_errors": [], "safe_offset": 0}
+
+
+def _apply_session_record(state, o):
+    s = state["summary"]
+    files = state["files"]
+    exec_calls = state["exec_calls"]
+    parse_errors = state["parse_errors"]
+    try:
+        if not isinstance(o, dict):
+            return
+        p = o.get("payload", {}) or {}
+        if not isinstance(p, dict):
+            _add_parse_error(parse_errors, "jsonl schema: payload is not an object")
+            return
+        ts = o.get("timestamp", "")
+        ets = _epoch(ts)
+        if ets:
+            s["last_ts"] = max(s["last_ts"], ets)
+            if s["last_event_epoch"] is None or ets > s["last_event_epoch"]:
+                s["last_event_epoch"] = ets
+                s["last_event_ts"] = ts
+        otype, ptype = o.get("type"), p.get("type", "")
+        if otype == "session_meta" or ("cwd" in p and not s["cwd"]):
+            s["cwd"] = p.get("cwd", s["cwd"]); s["model"] = (p.get("model") or o.get("model") or s["model"])
+        elif ptype == "task_started":
+            s["started"] = p.get("started_at"); s["ctx_window"] = p.get("model_context_window")
+        elif ptype == "user_message":
+            s["prompt"] = (p.get("message") or "")[:5000]
+        elif ptype == "agent_message":
+            m = (p.get("message") or "").strip()
+            if m:
+                s["last_msg"] = m
+                _event(s["events"], ts, "msg", m, True)
+        elif ptype == "function_call" and p.get("name") == "exec_command":
+            try:
+                args = json.loads(p.get("arguments", "{}"))
+                cmd = args.get("cmd", "")
+            except Exception:
+                cmd = p.get("arguments", "")
+            cmd = _WS_RE.sub(" ", str(cmd)).strip()
+            if cmd:
+                s["n_cmds"] += 1; s["last_cmd"] = cmd
+                if p.get("call_id"):
+                    exec_calls[p.get("call_id")] = {"cmd": cmd, "ts": ts, "epoch": ets}
+                _event(s["events"], ts, "cmd", cmd[:240], False)
+        elif ptype == "function_call_output":
+            out = str(p.get("output", ""))
+            call_id = p.get("call_id")
+            call = exec_calls.pop(call_id, None) if call_id else None
+            if call or out.startswith("Chunk ID:"):
+                code = _exit_code(out)
+                cmd = (call or {}).get("cmd") if isinstance(call, dict) else (call or s["last_cmd"])
+                entry = {"ts": ts, "cmd": cmd, "exit_code": code, "output": _trim_output(out)}
+                s["outputs"].append(entry)
+                _trim_tail_in_place(s["outputs"], _OUTPUT_TAIL_MAX)
+                if code not in (None, 0):
+                    err = _error_entry(ts, entry["cmd"], code, entry["output"])
                     s["errors"].append(err)
                     _trim_tail_in_place(s["errors"], _ERROR_TAIL_MAX)
-                    _event(s["events"], ts, "err", f"{err['label']}: apply_patch", True)
-            elif ptype == "token_count":
-                rate_limits = p.get("rate_limits") or {}
-                primary = _rate_sample(rate_limits.get("primary") or {}, ts, ets)
-                if primary is not None:
-                    s["rate_primary"] = primary
-                    s["rate_pct"] = primary["pct"]
-                secondary = _rate_sample(rate_limits.get("secondary") or {}, ts, ets)
-                if secondary is not None:
-                    s["rate_secondary"] = secondary
-                info = p.get("info") or {}
-                if info:
-                    s["model"] = (p.get("model") or info.get("model") or info.get("model_name") or s.get("model") or DEFAULT_MODEL)
-                    s["tokens"] = _normalize_usage(info, s["model"])
-                    if info.get("model_context_window"):
-                        s["ctx_window"] = info.get("model_context_window")
-        except Exception as e:
-            _add_parse_error(parse_errors, f"jsonl schema: {e}")
+                    _event(s["events"], ts, "err", f"{err['label']}: {entry['cmd']}", True)
+                else:
+                    _event(s["events"], ts, "out", entry["cmd"], False)
+        elif ptype == "custom_tool_call" and p.get("name") == "apply_patch":
+            s["n_edits"] += 1
+            _event(s["events"], ts, "edit", "apply_patch", True)
+        elif ptype == "custom_tool_call_output":
+            output = str(p.get("output", ""))
+            for m in _PATCH_FILE_RE.finditer(output):
+                files.add(os.path.basename(m.group(1)))
+            if "error" in output.lower() or "failed" in output.lower():
+                err = _error_entry(ts, "apply_patch", None, output)
+                s["errors"].append(err)
+                _trim_tail_in_place(s["errors"], _ERROR_TAIL_MAX)
+                _event(s["events"], ts, "err", f"{err['label']}: apply_patch", True)
+        elif ptype == "token_count":
+            rate_limits = p.get("rate_limits") or {}
+            primary = _rate_sample(rate_limits.get("primary") or {}, ts, ets)
+            if primary is not None:
+                s["rate_primary"] = primary
+                s["rate_pct"] = primary["pct"]
+            secondary = _rate_sample(rate_limits.get("secondary") or {}, ts, ets)
+            if secondary is not None:
+                s["rate_secondary"] = secondary
+            info = p.get("info") or {}
+            if info:
+                s["model"] = (p.get("model") or info.get("model") or info.get("model_name") or s.get("model") or DEFAULT_MODEL)
+                s["tokens"] = _normalize_usage(info, s["model"])
+                if info.get("model_context_window"):
+                    s["ctx_window"] = info.get("model_context_window")
+    except Exception as e:
+        _add_parse_error(parse_errors, f"jsonl schema: {e}")
+
+
+def _consume_jsonl_range(path, state, size=None, start=0, incremental=False):
+    safe_offset = start
+    try:
+        with _open_read_binary(path) as fh:
+            if size is None:
+                fh.seek(0, os.SEEK_END); size = fh.tell()
+            fh.seek(start)
+            while fh.tell() < size:
+                raw = fh.readline()
+                if not raw:
+                    break
+                end = fh.tell()
+                complete = raw.endswith(b"\n")
+                if incremental and not complete:
+                    return False, safe_offset
+                obj = _jsonl_obj(raw, state["parse_errors"])
+                if complete:
+                    safe_offset = end
+                if obj is not None:
+                    _apply_session_record(state, obj)
+    except Exception:
+        return True, safe_offset
+    return True, safe_offset
+
+
+def _finalize_parse_state(state):
+    s = state["summary"]
+    files = state["files"]
+    exec_calls = state["exec_calls"]
+    parse_errors = state["parse_errors"]
     if parse_errors:
         err = _error_entry("", "jsonl parser", None, "JSONL parse damage: " + "; ".join(parse_errors))
         s["errors"].append(err)
@@ -1260,6 +1423,91 @@ def parse_session(path, st=None):
     s["outputs"] = s["outputs"][-5:]
     s["errors"] = s["errors"][-5:]
     return s
+
+
+def _parse_session_state(path, st):
+    state = _new_parse_state(path, st)
+    ok, safe_offset = _consume_jsonl_range(path, state, st.st_size, 0, incremental=False)
+    if not ok:
+        return None
+    state["safe_offset"] = safe_offset
+    _finalize_parse_state(state)
+    return state
+
+
+def parse_session(path, st=None):
+    """Extract a rich summary + event stream from one rollout jsonl."""
+    if st is None:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+    state = _parse_session_state(path, st)
+    return state["summary"] if state else None
+
+
+def _parse_cache_entry(path, st, state, head_sig=None):
+    ident = _stat_identity(st)
+    head_sig_len = min(int(st.st_size), _PARSE_HEAD_SIG_BYTES)
+    if head_sig is None and ident:
+        head_sig = _head_signature(path, head_sig_len)
+    return {
+        "mtime": st.st_mtime,
+        "size": st.st_size,
+        "dev": ident[0] if ident else None,
+        "ino": ident[1] if ident else None,
+        "head_sig": head_sig if ident else None,
+        "head_sig_len": head_sig_len,
+        "safe_offset": state.get("safe_offset", 0),
+        "summary": state["summary"],
+        "state": state,
+    }
+
+
+def _full_parse_cache_entry(path, st):
+    state = _parse_session_state(path, st)
+    if state is None:
+        return None
+    return _parse_cache_entry(path, st, state)
+
+
+def _parse_cache_hit(ent, st):
+    return (isinstance(ent, dict) and ent.get("mtime") == st.st_mtime and
+            ent.get("size") == st.st_size and ent.get("summary") is not None)
+
+
+def _incremental_parse_cache_entry(path, st, ent):
+    if not isinstance(ent, dict):
+        return None
+    ident = _stat_identity(st)
+    if ident is None or ent.get("dev") != ident[0] or ent.get("ino") != ident[1]:
+        return None
+    old_size = ent.get("size")
+    if not isinstance(old_size, int) or st.st_size <= old_size:
+        return None
+    if ent.get("safe_offset") != old_size:
+        return None
+    head_sig_len = ent.get("head_sig_len")
+    if not isinstance(head_sig_len, int) or not ent.get("head_sig"):
+        return None
+    cur_head_sig = _head_signature(path, head_sig_len)
+    if cur_head_sig != ent.get("head_sig"):
+        return None
+    cached_state = ent.get("state")
+    if not isinstance(cached_state, dict) or cached_state.get("parse_errors"):
+        return None
+    state = copy.deepcopy(cached_state)
+    state["summary"]["last_ts"] = max(state["summary"].get("last_ts") or st.st_mtime, st.st_mtime)
+    ok, safe_offset = _consume_jsonl_range(path, state, st.st_size, old_size, incremental=True)
+    if not ok or state.get("parse_errors"):
+        return None
+    state["safe_offset"] = safe_offset
+    _finalize_parse_state(state)
+    if state.get("safe_offset") != st.st_size:
+        return None
+    new_head_sig_len = min(int(st.st_size), _PARSE_HEAD_SIG_BYTES)
+    reusable_head_sig = cur_head_sig if head_sig_len == new_head_sig_len else None
+    return _parse_cache_entry(path, st, state, reusable_head_sig)
 
 
 def _mtime(path):
@@ -1280,14 +1528,14 @@ def _parse_session_files(files, stat_map=None):
                 continue
         with _PARSE_CACHE_LOCK:
             ent = _PARSE_CACHE.get(f)
-        if ent and ent[0] == st.st_mtime and ent[1] == st.st_size:
-            out.append(ent[2]); continue          # unchanged → reuse cached summary
-        s = parse_session(f, st)
-        if s is None:
+        if _parse_cache_hit(ent, st):
+            out.append(ent["summary"]); continue  # unchanged → reuse cached summary
+        ent = _incremental_parse_cache_entry(f, st, ent) or _full_parse_cache_entry(f, st)
+        if ent is None:
             continue
         with _PARSE_CACHE_LOCK:
-            _PARSE_CACHE[f] = (st.st_mtime, st.st_size, s)
-        out.append(s)
+            _PARSE_CACHE[f] = ent
+        out.append(ent["summary"])
     return out
 
 
@@ -1337,12 +1585,13 @@ def _stage(s, age_sec):
     if age_sec is not None and age_sec > ACTIVE_STALE_SEC and not s.get("pending_long"):
         return "idle"
     for e in reversed(s.get("events", [])):
-        k, t = e.get("k"), (e.get("t") or "").lower()
+        k = e.get("k")
         if k == "edit":
             return "editing"
         if k == "err":
             return "verifying"
         if k == "cmd":
+            t = (e.get("t") or "").lower()
             if _STAGE_VERIFY_RE.search(t):
                 return "verifying"
             if _STAGE_READ_RE.search(t):
@@ -1481,20 +1730,10 @@ def _track_key(out):
     return _normalize_out(out) or ""
 
 
-def _output_has_message(out):
+def _output_status_and_has_message(out):
     path = _normalize_out(out)
     if not path:
-        return False
-    try:
-        return os.path.exists(path) and os.path.getsize(path) > 0
-    except Exception:
-        return False
-
-
-def _output_status(out):
-    path = _normalize_out(out)
-    if not path:
-        return None
+        return None, False
     try:
         with _open_read_binary(path) as fh:
             fh.seek(0, os.SEEK_END)
@@ -1502,9 +1741,20 @@ def _output_status(out):
             fh.seek(max(0, size - 65536))
             data = fh.read().decode("utf-8", "replace")
     except Exception:
-        return None
+        try:
+            return None, os.path.exists(path) and os.path.getsize(path) > 0
+        except Exception:
+            return None, False
     matches = _OUTPUT_STATUS_RE.findall(data)
-    return matches[-1] if matches else None
+    return (matches[-1] if matches else None), size > 0
+
+
+def _output_has_message(out):
+    return _output_status_and_has_message(out)[1]
+
+
+def _output_status(out):
+    return _output_status_and_has_message(out)[0]
 
 
 def _remember_jobs(jobs, now, state=None):
@@ -1572,7 +1822,7 @@ def _tracked_termination(rec):
     if rec.get("killed_by_dashboard"):
         return {"status": "killed", "status_label": "killed (dashboard)",
                 "reason": "terminated by dashboard /api/kill", "out": rec.get("out"), "dashboard": True}
-    dispatch_status = _output_status(rec.get("out"))
+    dispatch_status, has_message = _output_status_and_has_message(rec.get("out"))
     if dispatch_status in ("timeout", "error"):
         return {"status": "error", "status_label": dispatch_status,
                 "reason": f"dispatch STATUS={dispatch_status}", "out": rec.get("out"),
@@ -1581,7 +1831,7 @@ def _tracked_termination(rec):
         return {"status": "done", "status_label": "completed",
                 "reason": "dispatch STATUS=ok", "out": rec.get("out"),
                 "dashboard": False, "dispatch_status": dispatch_status}
-    if _output_has_message(rec.get("out")):
+    if has_message:
         return {"status": "done", "status_label": "completed",
                 "reason": "output-last-message exists and is non-empty", "out": rec.get("out"), "dashboard": False}
     return {"status": "interrupted", "status_label": "killed/interrupted",
@@ -1823,7 +2073,9 @@ def _save_cost_index(index):
 
 
 def _file_sig(path, st):
-    return (_path_key(path), int(st.st_dev), int(st.st_ino), int(st.st_size), float(st.st_mtime))
+    ident = _stat_identity(st)
+    dev, ino = ident if ident else (0, 0)
+    return (path, dev, ino, int(st.st_size), float(st.st_mtime))
 
 
 def _head_sig(path, limit=_COST_HEAD_SIG_BYTES):
@@ -1961,9 +2213,11 @@ def _cost_file_record(path, st, old=None, reset=False):
         rec, _, _, _ = _cost_file_record(path, st, None, True)
         return rec, True, True, True
 
+    ident = _stat_identity(st)
+    dev, ino = ident if ident else (0, 0)
     rec = {
-        "dev": int(st.st_dev),
-        "ino": int(st.st_ino),
+        "dev": dev,
+        "ino": ino,
         "size": int(st.st_size),
         "mtime": float(st.st_mtime),
         "offset": int(offset),
@@ -1976,8 +2230,8 @@ def _cost_file_record(path, st, old=None, reset=False):
     if parse_errors:
         rec["parse_errors"] = parse_errors[:3]
     meta_changed = (
-        int(old.get("dev", -1)) != int(st.st_dev) or
-        int(old.get("ino", -1)) != int(st.st_ino) or
+        int(old.get("dev", -1)) != dev or
+        int(old.get("ino", -1)) != ino or
         int(old.get("size", -1)) != int(st.st_size) or
         float(old.get("mtime") or 0) != float(st.st_mtime)
     )
@@ -2027,7 +2281,8 @@ def _refresh_cost_index(entries, min_ts=None):
         old = files.get(path)
         reset = False
         if isinstance(old, dict):
-            same_identity = int(old.get("dev", -1)) == int(st.st_dev) and int(old.get("ino", -1)) == int(st.st_ino)
+            ident = _stat_identity(st)
+            same_identity = bool(ident) and int(old.get("dev", -1)) == ident[0] and int(old.get("ino", -1)) == ident[1]
             old_size = int(old.get("size") or 0)
             old_offset = int(old.get("offset") or 0)
             complete = old_offset >= int(st.st_size)
@@ -2322,9 +2577,12 @@ def snapshot():
     sessions = all_sessions(SESSION_LIMIT, session_files, session_stats)
     # enrich running jobs with their live session: match each job to the session whose
     # prompt matches this dispatch (so parallel agents in the same dir map to the RIGHT one)
+    sessions_by_cwd = {}
+    for s in sessions:
+        sessions_by_cwd.setdefault(_path_key(s["cwd"]), []).append(s)
     used = set()
     for j in jobs:
-        cand = [s for s in sessions if _same_path(s.get("cwd"), j.get("cwd_raw"))]
+        cand = sessions_by_cwd.get(_path_key(j["cwd_raw"]), [])
         match = None
         pl = (j.get("plabel") or "")[:60].lower()
         if pl:
@@ -2340,13 +2598,25 @@ def snapshot():
             used.add(id(match))
         j["session"] = match
     _remember_jobs(jobs, now)
-    running = [_job_payload(j, j.get("session"), now) for j in jobs]
+    running = []
+    # Counts only live rows derived from the current ps codex process list.
+    status_counts = {k: 0 for k in ("running", "zombie", "error", "done", "killed", "interrupted")}
+    stage_counts = {k: 0 for k in STAGE_ORDER}
+    for j in jobs:
+        payload = _job_payload(j, j.get("session"), now)
+        running.append(payload)
+        status = payload["status"]
+        if status in status_counts:
+            status_counts[status] += 1
+        stage = payload.get("stage")
+        if stage in stage_counts:
+            stage_counts[stage] += 1
 
     feed = []
     for s in sessions:
         age = now - s["last_ts"]
         if age < FEED_WINDOW_SEC:
-            tag = _path_leaf(s["cwd"], "?")
+            tag = _path_leaf(_short(s["cwd"]), "?")
             for e in s["events"]:
                 feed.append({**e, "src": tag})
     feed.sort(key=lambda e: e.get("ts") or "", reverse=True)
@@ -2365,7 +2635,7 @@ def snapshot():
             "key": _session_key(s), "status": status, "status_label": activity.get("status_label") or status,
             "termination": activity.get("termination"), "stage": _stage(s, age_sec),
             "age_min": round((age_sec or 0) / 60, 1), "last_age_sec": age_sec,
-            "cwd": _path_leaf(s["cwd"], "session"), "cwd_raw": s["cwd"],
+            "cwd": _path_leaf(_short(s["cwd"]), "session"), "cwd_raw": s["cwd"],
             "prompt": (s["prompt"] or s["last_msg"] or "(session)")[:500],
             "n_cmds": s["n_cmds"], "n_edits": s["n_edits"], "files": s["files"][:4],
             "rate_pct": s["rate_pct"], "tokens": _api_tokens(s["tokens"]), "token_total": s["tokens"].get("total", 0),
@@ -2377,11 +2647,17 @@ def snapshot():
     today = time.strftime("%Y/%m/%d")
     today_date = f"{today[5:7]}/{today[8:10]} ({('Mon','Tue','Wed','Thu','Fri','Sat','Sun')[time.localtime().tm_wday]})"
     today_dir = os.path.join(SESS, *today.split("/"))
-    today_dir_key = _path_key(today_dir)
-    today_files = [f for f in session_files if _path_key(os.path.dirname(f)) == today_dir_key]
+    today_key = _path_key(today_dir)
+    today_files = [f for f in session_files if _path_key(os.path.dirname(f)) == today_key]
     today_n = len(today_files)
     today_hours = _session_hour_buckets(today_files, session_stats)
-    today_sessions = _parse_session_files(sorted(today_files, key=lambda f: _session_mtime(f, session_stats), reverse=True), session_stats)
+    today_sorted = sorted(today_files, key=lambda f: _session_mtime(f, session_stats), reverse=True)
+    sessions_by_file = {s.get("file"): s for s in sessions}
+    missing_today_files = [f for f in today_sorted if f not in sessions_by_file]
+    missing_today_sessions = _parse_session_files(missing_today_files, session_stats)
+    missing_today_by_file = {s.get("file"): s for s in missing_today_sessions}
+    today_sessions = [sessions_by_file.get(f) or missing_today_by_file.get(f) for f in today_sorted]
+    today_sessions = [s for s in today_sessions if s is not None]
     rpc_rate = _active_rpc_rate(now)
     if rpc_rate:
         rate = float(rpc_rate["primary_pct"])
@@ -2416,12 +2692,6 @@ def snapshot():
         cost_total_raw += tokens.get("cost", 0.0)
         cost_estimate = cost_estimate or bool(tokens.get("cost_estimate"))
     cost_total = round(cost_total_raw, 4)
-    # Counts only live rows derived from the current ps codex process list.
-    status_counts = {k: 0 for k in ("running", "zombie", "error", "done", "killed", "interrupted")}
-    for j in running:
-        status = j["status"]
-        if status in status_counts:
-            status_counts[status] += 1
     series = cost_series(now, session_files, session_stats)
     source_degraded = _ps_source_degraded()
     source_degraded.update(_storage_degraded())
@@ -2430,7 +2700,7 @@ def snapshot():
             "today_hours": today_hours, "rate": rate, "rate7d": rate7d,
             "rate_resets_at": rate_resets_at, "rate7d_resets_at": rate7d_resets_at,
             "rate_account": rate_account, "rate_plan": rate_plan, "rate_source": rate_source,
-            "stale_sec": ACTIVE_STALE_SEC, "status_counts": status_counts,
+            "stale_sec": ACTIVE_STALE_SEC, "status_counts": status_counts, "stage_counts": stage_counts,
             "token_total": token_total, "cost_total": cost_total, "cost_estimate": cost_estimate,
             "token_total_recent": token_total_recent, "cost_total_recent": cost_total_recent,
             "cost_series": series,
@@ -2444,6 +2714,10 @@ def _snapshot_shape(data):
     if not isinstance(counts, dict):
         counts = {}
     data["status_counts"] = {k: int(counts.get(k) or 0) for k in ("running", "zombie", "error", "done", "killed", "interrupted")}
+    stages = data.get("stage_counts")
+    if not isinstance(stages, dict):
+        stages = {}
+    data["stage_counts"] = {k: int(stages.get(k) or 0) for k in STAGE_ORDER}
     for key in ("running", "feed", "recent"):
         if not isinstance(data.get(key), list):
             data[key] = []
@@ -2574,7 +2848,7 @@ def _find_running_job(pid=None, out=None):
     out = _normalize_out(out)
     for j in running_jobs(use_cache_on_failure=False):
         pid_match = bool(pid) and str(j.get("pid")) == str(pid)
-        out_match = bool(out) and j.get("out") == out
+        out_match = bool(out) and _same_path(j.get("out"), out)
         if pid and out:
             if pid_match and out_match:
                 return j
@@ -2609,6 +2883,22 @@ def _snapshot_retry_source(payload):
     return None
 
 
+def _split_dispatch_command(raw):
+    if raw:
+        if _IS_WIN:
+            return _win_cmdline_to_argv(raw) or str(raw).split()
+        return shlex.split(raw)
+    if _IS_WIN:
+        return [_codex_rpc_bin() or "codex"]
+    return shlex.split("codex")
+
+
+def _display_cmd(cmd):
+    if _IS_WIN:
+        return subprocess.list2cmdline([str(c) for c in cmd])
+    return " ".join(shlex.quote(str(c)) for c in cmd)
+
+
 def post_kill(payload):
     pid = _parse_pid(payload.get("pid"))
     if pid is None:
@@ -2627,12 +2917,8 @@ def post_kill(payload):
         return {"ok": False, "error": "target pid output path changed; refusing to kill"}, 409
     try:
         if _IS_WIN:
-            proc = subprocess.run(["taskkill", "/F", "/T", "/PID", str(int(target_pid))],
-                                  capture_output=True, text=True, encoding="utf-8",
-                                  errors="replace", timeout=8)
-            if proc.returncode != 0:
-                err = (proc.stderr or proc.stdout or "").strip() or f"taskkill exited {proc.returncode}"
-                return {"ok": False, "error": err}, 500
+            if not _taskkill_tree(target_pid):
+                raise RuntimeError("taskkill failed")
         else:
             os.kill(int(target_pid), signal.SIGTERM)
         _mark_dashboard_kill(target_pid, job.get("out"), job)
@@ -2654,30 +2940,23 @@ def post_retry(payload):
         return {"ok": False, "error": "sandbox must be read-only or workspace-write"}, 400
     # CODEX_MONITOR_DISPATCH is an executable prefix that must accept codex CLI
     # args; the monitor appends: exec -C <cwd> -s <sandbox> <prompt>.
-    dispatch_raw = os.environ.get("CODEX_MONITOR_DISPATCH")
-    if dispatch_raw:
-        dispatch = (_win_cmdline_to_argv(dispatch_raw) if _IS_WIN else shlex.split(dispatch_raw))
-    else:
-        dispatch = [_codex_rpc_bin() or "codex"]
-    if not dispatch:
-        dispatch = [_codex_rpc_bin() or "codex"]
+    dispatch = _split_dispatch_command(os.environ.get("CODEX_MONITOR_DISPATCH"))
     cmd = dispatch + ["exec", "-C", cwd]
     cmd += ["-s", sandbox]
     cmd += [prompt]
     try:
-        popen_kwargs = {
+        kwargs = {
             "cwd": cwd if os.path.isdir(cwd) else HOME,
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.DEVNULL,
             "stderr": subprocess.DEVNULL,
         }
         if _IS_WIN:
-            popen_kwargs["creationflags"] = _win_creationflags()
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         else:
-            popen_kwargs["start_new_session"] = True
-        p = subprocess.Popen(cmd, **popen_kwargs)
-        cmd_display = subprocess.list2cmdline(cmd) if _IS_WIN else " ".join(shlex.quote(c) for c in cmd)
-        return {"ok": True, "pid": p.pid, "cmd": cmd_display}
+            kwargs["start_new_session"] = True
+        p = subprocess.Popen(cmd, **kwargs)
+        return {"ok": True, "pid": p.pid, "cmd": _display_cmd(cmd)}
     except Exception as e:
         return {"ok": False, "error": str(e)}, 500
 
@@ -2777,16 +3056,21 @@ body.offline{filter:saturate(.4)}
   white-space:nowrap;box-shadow:0 6px 18px rgba(42,29,16,.18);pointer-events:none;opacity:0;visibility:hidden;
   transform:translate(-50%,-100%);transition:opacity .12s ease,transform .12s ease,visibility .12s ease}
 .hour-tip.show{opacity:1;visibility:visible;transform:translate(-50%,-116%)}
-.feed-row{display:flex;align-items:center;justify-content:space-between;gap:14px;min-height:48px}
-.feed-row .v{flex:1;min-width:0}
-.feed-ring{display:flex;flex:0 0 auto;flex-direction:column;align-items:center;justify-content:center;gap:3px;margin-top:-1px}
-.feed-ring svg{width:48px;height:48px;overflow:visible}
-.ring-track{fill:none;stroke:#ddcba8;stroke-width:4.5;opacity:.78}
-.ring-progress{fill:none;stroke:var(--wire);stroke-width:4.5;stroke-linecap:butt;transform:rotate(-90deg);
-  transform-origin:50% 50%;stroke-dasharray:100;stroke-dashoffset:100;transition:stroke-dashoffset .6s ease,stroke .2s ease}
-.ring-progress.rate-ok{stroke:var(--wire)}
-.ring-progress.rate-warn{stroke:var(--warn)}
-.mini-cap{color:var(--dim);font:500 10px "JetBrains Mono",monospace;font-variant-numeric:tabular-nums}
+.stage-tip{display:flex;align-items:center;gap:5px}
+.stage-tip i{display:inline-block;width:6px;height:6px;border-radius:50%;background:currentColor}
+.stage-row{display:flex;align-items:center;justify-content:space-between;gap:14px;min-height:48px}
+.stage-row .v{flex:1;min-width:0}
+.stage-ring{display:flex;flex:0 0 auto;align-items:center;justify-content:center;margin-top:-1px}
+.stage-ring svg{width:56px;height:56px;overflow:visible}
+.stage-track{fill:none;stroke:#ddcba8;stroke-width:14;opacity:.78}
+.stage-segment{fill:none;stroke-width:14;stroke-linecap:butt;transform:rotate(-90deg);
+  transform-origin:50% 50%;transition:stroke-dasharray .6s ease,stroke-dashoffset .6s ease,opacity .15s ease,filter .15s ease}
+.stage-segment:hover{opacity:.8;filter:drop-shadow(0 0 2px rgba(42,29,16,.26))}
+.stage-legend{display:flex;flex-wrap:wrap;gap:4px 8px;margin-top:5px;color:var(--dim);
+  font:600 9.5px/1.1 "JetBrains Mono",monospace;font-variant-numeric:tabular-nums}
+.stage-legend:empty{display:none}
+.stage-legend span{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+.stage-legend i{display:inline-block;width:6px;height:6px;border-radius:50%;background:currentColor}
 .onair{display:inline-flex;align-items:center;gap:9px}
 .lamp{width:11px;height:11px;border-radius:50%;background:#c3ad81}
 .lamp.on{background:var(--ember);animation:pulse 1.5s infinite}
@@ -3049,7 +3333,7 @@ footer{margin-top:40px;color:var(--faint);font-size:10.5px;border-top:1px solid 
 ::-webkit-scrollbar{width:7px;height:7px}::-webkit-scrollbar-thumb{background:#cf5915}::-webkit-scrollbar-track{background:transparent}
 @media(max-width:640px){
   body{padding-inline:12px}.brand{display:block}.mastmeta{justify-content:flex-start}.dateline{text-align:left}.controls input{min-width:100%}.controls input.mini{min-width:54px;width:54px;flex:0}.controls .switch input{min-width:0;width:1px;height:1px;flex:0}.refresh-note{margin-left:0;width:100%}
-  .stat{min-width:50%;border-bottom:1px solid #d3c096}.sec{gap:8px 10px;flex-wrap:wrap}.sec .rule{flex:1 1 48px}.recent-control{margin-left:0}.rec{display:grid;grid-template-columns:24px 54px minmax(0,1fr);gap:4px 8px;padding-right:8px;align-items:baseline}.rec .idx{width:24px;grid-column:1}.rec .ago{min-width:0;grid-column:2}.rec .src{min-width:0;grid-column:3}.rec .p{grid-column:1 / -1;white-space:normal;overflow-wrap:anywhere}.rec .n{grid-column:1 / -1}.acts{width:100%}.el{margin-left:0}.kv.prompt-head{max-width:100%;white-space:normal;overflow-wrap:anywhere}
+  .stat{min-width:50%;border-bottom:1px solid #d3c096}.stage-legend{display:none}.sec{gap:8px 10px;flex-wrap:wrap}.sec .rule{flex:1 1 48px}.recent-control{margin-left:0}.rec{display:grid;grid-template-columns:24px 54px minmax(0,1fr);gap:4px 8px;padding-right:8px;align-items:baseline}.rec .idx{width:24px;grid-column:1}.rec .ago{min-width:0;grid-column:2}.rec .src{min-width:0;grid-column:3}.rec .p{grid-column:1 / -1;white-space:normal;overflow-wrap:anywhere}.rec .n{grid-column:1 / -1}.acts{width:100%}.el{margin-left:0}.kv.prompt-head{max-width:100%;white-space:normal;overflow-wrap:anywhere}
 }
 @media(prefers-reduced-motion:reduce){
   html{scroll-behavior:auto}
@@ -3083,7 +3367,7 @@ footer{margin-top:40px;color:var(--faint);font-size:10.5px;border-top:1px solid 
       <div class=rate-line><span class=rate-tag>7D</span><span class=rate-val id=s_rate_7d>—<small>%</small></span><div class=gauge><i id=s_rate_7d_bar style=width:0%></i></div></div>
     </div>
   </div>
-  <div class=stat title="feed from sessions active in last 30m, capped at 80 lines"><div class=l>Wire feed</div><div class=feed-row><div class=v id=s_feed>—</div><div class=feed-ring title="0/80"><svg viewBox="0 0 48 48" aria-hidden=true><circle class=ring-track cx=24 cy=24 r=20></circle><circle id=s_feed_ring class="ring-progress rate-ok" cx=24 cy=24 r=20 pathLength=100></circle></svg><span id=s_feed_cap class=mini-cap>0/80</span></div></div></div>
+  <div class=stat title="running jobs by current stage"><div class=l>Stage</div><div class=stage-row><div class=v id=s_stage_total>—</div><div id=s_stage_ring class=stage-ring title="0 running"><svg viewBox="0 0 56 56" role=img aria-label="stage distribution"><circle class=stage-track cx=28 cy=28 r=20></circle><g id=s_stage_segments></g></svg></div></div><div id=s_stage_legend class=stage-legend></div></div>
 </div>
 
 <div class=costwrap id=costwrap>
@@ -3169,6 +3453,9 @@ function fmtRecentAge(m){m=Math.floor(Number(m)||0); const mm=String(m%60).padSt
 function fmtTok(n){n=Number(n||0); if(n>=1000000)return (n/1000000).toFixed(1)+'M'; if(n>=1000)return Math.round(n/100)/10+'k'; return String(n);}
 function setText(el,v){if(el&&el.textContent!==String(v??''))el.textContent=String(v??'');}
 function setHTML(el,v){if(el&&el.innerHTML!==v)el.innerHTML=v;}
+function setClass(el,v){if(el&&el.className!==v)el.className=v;}
+function setStyle(el,k,v){if(el&&el.style[k]!==String(v))el.style[k]=v;}
+function setAttr(el,k,v){if(el&&el.getAttribute(k)!==String(v))el.setAttribute(k,String(v));}
 function safeArray(v){return Array.isArray(v)?v:[];}
 function safeObject(v){return v&&typeof v==='object'&&!Array.isArray(v)?v:{};}
 function safeRender(name,fn,fallback){
@@ -3182,6 +3469,7 @@ function normalizeSnapshot(raw){
   d.recent=safeArray(d.recent);
   d.today_hours=safeArray(d.today_hours).slice(0,24);
   d.status_counts=safeObject(d.status_counts);
+  d.stage_counts=safeObject(d.stage_counts);
   d.source_degraded=safeObject(d.source_degraded);
   d.running.forEach((j,i)=>{if(j&&typeof j==='object'&&!stableId(j))j._stable_fallback='idx_'+i;});
   return d;
@@ -3192,7 +3480,7 @@ function syncPressedButtons(root, attr, value){
   [...el.querySelectorAll('button')].forEach(b=>{
     const on=b.dataset[attr]===value;
     b.classList.toggle('on',on);
-    b.setAttribute('aria-pressed',on?'true':'false');
+    setAttr(b,'aria-pressed',on?'true':'false');
   });
 }
 function emptyHTML(text){return `<div class=empty>${esc(text)}</div>`;}
@@ -3218,7 +3506,8 @@ function formatRateReset(epoch, withDate=false){
   const hh=String(d.getHours()).padStart(2,'0'), mm=String(d.getMinutes()).padStart(2,'0');
   return withDate?`${d.getMonth()+1}/${d.getDate()} ${hh}:${mm}`:`${hh}:${mm}`;
 }
-const FEED_CAP=80;
+const STAGE_ORDER=['reading','analyzing','editing','verifying','starting','idle'];
+const STAGE_COLORS={reading:'var(--blue)',analyzing:'var(--wire)',editing:'var(--ember)',verifying:'var(--warn)',starting:'var(--violet)',idle:'var(--dim)'};
 let liveStatResizeObserver=null;
 function liveStatReadWidth(stack){
   return Math.max(58,stack.clientWidth||stack.getBoundingClientRect().width||146);
@@ -3260,8 +3549,8 @@ function renderLiveStat(d, counts){
   if(stack.dataset.sig===sig)return;
   stack.dataset.sig=sig;
   const label=count===1?'1 live agent':`${count} live agents`;
-  stack.setAttribute('aria-label',label);
-  const wrap=stack.closest('.agent-stack-wrap'); if(wrap){wrap.title=label;wrap.style.display=count>0?'':'none';}
+  setAttr(stack,'aria-label',label);
+  const wrap=stack.closest('.agent-stack-wrap'); if(wrap){wrap.title=label;setStyle(wrap,'display',count>0?'':'none');}
   const target=visible||1;
   const fresh=[];
   let plates=Array.from(stack.querySelectorAll('.agent-plate'));
@@ -3345,28 +3634,111 @@ function hideHourTip(){if(hourTipEl)hourTipEl.classList.remove('show');}
 document.addEventListener('mouseover',e=>{const bar=e.target.closest&&e.target.closest('#s_today_hours i'); if(bar)showHourTip(bar);});
 document.addEventListener('mousemove',e=>{const bar=e.target.closest&&e.target.closest('#s_today_hours i'); if(bar&&hourTipEl&&hourTipEl.classList.contains('show'))moveHourTip(bar);});
 document.addEventListener('mouseout',e=>{const bar=e.target.closest&&e.target.closest('#s_today_hours i'); if(bar)hideHourTip();});
-function renderFeedGauge(feed){
-  const n=Array.isArray(feed)?feed.length:0, pct=Math.min(100,Math.max(0,n/FEED_CAP*100));
-  const ring=document.getElementById('s_feed_ring');
-  const feedWrap=ring?ring.closest('.feed-ring'):null;
-  if(feedWrap)feedWrap.style.display=n>0?'':'none';
-  if(ring){
-    ring.style.strokeDashoffset=(100-pct).toFixed(2);
-    ring.classList.remove('rate-ok','rate-warn','rate-bad');
-    ring.classList.add(pct>85?'rate-warn':'rate-ok');
-    const wrap=ring.closest('.feed-ring'); if(wrap)wrap.title=`${n}/${FEED_CAP}`;
+let stageTipEl=null;
+function stageTip(){
+  if(stageTipEl)return stageTipEl;
+  stageTipEl=document.createElement('div');
+  stageTipEl.className='hour-tip stage-tip';
+  stageTipEl.setAttribute('role','tooltip');
+  stageTipEl.innerHTML='<i></i><span></span>';
+  document.body.appendChild(stageTipEl);
+  return stageTipEl;
+}
+function moveStageTip(e){
+  const tip=stageTip();
+  tip.style.left=(e.pageX+10)+'px';
+  tip.style.top=(e.pageY-8)+'px';
+}
+function showStageTip(seg,e){
+  const tip=stageTip(), stage=seg.dataset.stage||'', count=seg.dataset.count||'0';
+  const dot=tip.firstElementChild, text=dot&&dot.nextElementSibling;
+  if(dot)dot.style.color=seg.getAttribute('stroke')||'currentColor';
+  if(text)text.textContent=`${stage}: ${count}`;
+  moveStageTip(e);
+  tip.classList.add('show');
+}
+function hideStageTip(){if(stageTipEl)stageTipEl.classList.remove('show');}
+function initStageTip(){
+  const segs=document.getElementById('s_stage_segments');
+  if(!segs||segs.dataset.tipReady)return;
+  segs.dataset.tipReady='1';
+  segs.addEventListener('mouseover',e=>{const seg=e.target.closest&&e.target.closest('.stage-segment'); if(seg)showStageTip(seg,e);});
+  segs.addEventListener('mousemove',e=>{const seg=e.target.closest&&e.target.closest('.stage-segment'); if(seg&&stageTipEl&&stageTipEl.classList.contains('show'))moveStageTip(e);});
+  segs.addEventListener('mouseout',e=>{const seg=e.target.closest&&e.target.closest('.stage-segment'); if(seg)hideStageTip();});
+}
+initStageTip();
+function ensureStageSegments(segs){
+  const nodes=Array.from(segs.querySelectorAll('.stage-segment'));
+  const ready=nodes.length===STAGE_ORDER.length&&STAGE_ORDER.every((stage,i)=>nodes[i]&&nodes[i].dataset.stage===stage);
+  if(ready)return nodes;
+  segs.innerHTML='';
+  const ns='http://www.w3.org/2000/svg';
+  return STAGE_ORDER.map(stage=>{
+    const circle=document.createElementNS(ns,'circle');
+    circle.setAttribute('class','stage-segment');
+    circle.setAttribute('cx','28');
+    circle.setAttribute('cy','28');
+    circle.setAttribute('r','20');
+    circle.setAttribute('pathLength','100');
+    circle.setAttribute('stroke',STAGE_COLORS[stage]);
+    circle.setAttribute('stroke-dasharray','0 100');
+    circle.setAttribute('stroke-dashoffset','0');
+    circle.dataset.stage=stage;
+    circle.dataset.count='0';
+    circle.setAttribute('aria-label',`${stage}: 0`);
+    segs.appendChild(circle);
+    return circle;
+  });
+}
+function renderStageCard(counts){
+  const data=(counts&&typeof counts==='object')?counts:{};
+  const parts=STAGE_ORDER.map(stage=>({stage,n:Math.max(0,Number(data[stage])||0)}));
+  const stageSig=parts.map(p=>p.n).join('|');
+  const total=parts.reduce((sum,p)=>sum+p.n,0);
+  const wrap=document.getElementById('s_stage_ring');
+  const segs=document.getElementById('s_stage_segments');
+  const legend=document.getElementById('s_stage_legend');
+  const nodes=segs?ensureStageSegments(segs):null;
+  if(segs&&nodes&&segs.dataset.sig===stageSig)return;
+  setText(document.getElementById('s_stage_total'),total);
+  if(wrap){
+    setStyle(wrap,'display','');
+    wrap.title=total>0?parts.filter(p=>p.n>0).map(p=>`${p.stage}: ${p.n}`).join(' / '):'0 running';
+    const svg=wrap.querySelector('svg');
+    if(svg)setAttr(svg,'aria-label',total>0?`stage distribution, ${wrap.title}`:'stage distribution, 0 running');
   }
-  setText(document.getElementById('s_feed_cap'),`${n}/${FEED_CAP}`);
+  if(!segs)return;
+  let offset=0;
+  parts.forEach((p,i)=>{
+    const pct=total>0?p.n/total*100:0, dash=`${pct.toFixed(4)} ${(100-pct).toFixed(4)}`;
+    const seg=nodes[i];
+    if(!seg)return;
+    setAttr(seg,'stroke',STAGE_COLORS[p.stage]);
+    setAttr(seg,'stroke-dasharray',dash);
+    setAttr(seg,'stroke-dashoffset',(-offset).toFixed(4));
+    seg.dataset.stage=p.stage;
+    seg.dataset.count=String(p.n);
+    setAttr(seg,'aria-label',`${p.stage}: ${p.n}`);
+    offset+=pct;
+  });
+  if(legend){
+    setHTML(legend,parts.filter(p=>p.n>0).map(p=>`<span style="color:${STAGE_COLORS[p.stage]}"><i></i>${p.stage} ${p.n}</span>`).join(''));
+  }
+  segs.dataset.sig=stageSig;
 }
 function renderRateLine(value, valueId, barId){
   const n=Number(value), ok=Number.isFinite(n);
-  setHTML(document.getElementById(valueId),(ok?Math.round(n):'—')+'<small>%</small>');
+  const text=(ok?Math.round(n):'—')+'<small>%</small>';
+  setHTML(document.getElementById(valueId),text);
   const bar=document.getElementById(barId);
   if(!bar)return;
   const pct=ok?Math.min(100,Math.max(0,n)):0;
-  bar.style.width=pct+'%';
-  bar.classList.remove('rate-ok','rate-warn','rate-bad');
-  if(ok)bar.classList.add(pct>85?'rate-bad':(pct>=70?'rate-warn':'rate-ok'));
+  const cls=ok?(pct>85?'rate-bad':(pct>=70?'rate-warn':'rate-ok')):'';
+  const sig=text+'|'+pct+'|'+cls;
+  if(bar.dataset.sig===sig)return;
+  bar.dataset.sig=sig;
+  setStyle(bar,'width',pct+'%');
+  setClass(bar,cls);
 }
 function renderRateAccount(d){
   const el=document.getElementById('s_rate_account'); if(!el)return;
@@ -3375,14 +3747,14 @@ function renderRateAccount(d){
   if(!account&&!plan){
     setText(el,'');
     el.removeAttribute('title');
-    el.style.display='none';
+    setStyle(el,'display','none');
     return;
   }
   const user=account?account.split('@')[0]:plan;
   const text=plan&&account?`${user} · ${plan}`:user;
   setText(el,text);
   el.title=account?(plan?`${account} · ${plan}`:account):plan;
-  el.style.display='block';
+  setStyle(el,'display','block');
 }
 function renderRate(d){
   renderRateAccount(d);
@@ -3400,8 +3772,8 @@ function degradedBanner(d){
 }
 function setWireBanner(msg){
   const el=document.getElementById('wirebanner'); if(!el)return;
-  if(msg){setText(el,msg);el.style.display='block';}
-  else{setText(el,'');el.style.display='none';}
+  if(msg){setText(el,msg);setStyle(el,'display','block');}
+  else{setText(el,'');setStyle(el,'display','none');}
 }
 function renderBulletin(d){
   const c=(d&&d.status_counts)||{};
@@ -3595,8 +3967,11 @@ function parseElapsed(s){let p=String(s||'0').split(/[:-]/).map(Number);let sec=
 function updateSelect(id, values){
   const el=document.getElementById(id), old=controlValue(id);
   if(old&&!values.includes(old))values=[old,...values];
+  const sig=values.join('\0')+'|'+old;
+  if(el&&el.dataset.sig===sig)return;
   const html='<option value="">all</option>'+values.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join('');
   setHTML(el,html); el.value=values.includes(old)?old:''; controlState[id]=el.value;
+  if(el)el.dataset.sig=sig;
 }
 function renderControls(d){
   const running=safeArray(d&&d.running);
@@ -4017,13 +4392,13 @@ async function tick(manual=false){
   const counts=safeRender('renderBulletin',()=>renderBulletin(d),{zombie:0,error:0})||{zombie:0,error:0};
   setText(document.getElementById('ts'),d.ts); setText(document.getElementById('date'),d.date);
   setText(document.getElementById('meta_date'),d.date); setText(document.getElementById('meta_no'),d.today);
-  document.getElementById('lamp').className=counts.error>0?'lamp bad':('lamp'+(d.count>0?' on':''));
+  setClass(document.getElementById('lamp'),counts.error>0?'lamp bad':('lamp'+(d.count>0?' on':'')));
   setText(document.getElementById('onair'),d.count>0?'ON AIR':'STANDBY');
-  document.getElementById('onair').style.color=counts.error>0?'var(--bad)':(d.count>0?'var(--ember)':'var(--dim)');
+  setStyle(document.getElementById('onair'),'color',counts.error>0?'var(--bad)':(d.count>0?'var(--ember)':'var(--dim)'));
   setText(document.getElementById('s_run'),d.count); safeRender('renderLiveStat',()=>renderLiveStat(d,counts));
   setText(document.getElementById('s_today'),d.today); setText(document.getElementById('s_today_date'),d.today_date||'--/--'); safeRender('renderTodayHours',()=>renderTodayHours(d.today_hours));
   safeRender('renderRate',()=>renderRate(d));
-  setText(document.getElementById('s_feed'),d.feed.length); safeRender('renderFeedGauge',()=>renderFeedGauge(d.feed));
+  safeRender('renderStageCard',()=>renderStageCard(d.stage_counts));
   safeRender('renderCost',()=>renderCost(d));
   safeRender('renderControls',()=>renderControls(d));
   safeRender('renderCards',()=>renderCards());
@@ -4035,9 +4410,9 @@ async function tick(manual=false){
   if(runId!==tickRun)return;
   console.error('CODEX WIRE fetch failed:',e);
   document.body.classList.add('offline');setWireBanner(e.apiBanner||(timedOut?'LINE DOWN — request timed out':'LINE DOWN — connection lost'));
-  document.getElementById('lamp').className='lamp bad';
+  setClass(document.getElementById('lamp'),'lamp bad');
   setText(document.getElementById('ts'),'connection lost');setText(document.getElementById('onair'),'LINE DOWN');
-  document.getElementById('onair').style.color='var(--bad)';
+  setStyle(document.getElementById('onair'),'color','var(--bad)');
  }finally{
   clearTimeout(timeout);
   if(runId===tickRun){
@@ -4146,18 +4521,6 @@ class H(BaseHTTPRequestHandler):
         self._send(code, body, "application/json; charset=utf-8")
 
 
-class CodexWireHTTPServer(ThreadingHTTPServer):
-    allow_reuse_address = not _IS_WIN
-
-    def server_bind(self):
-        if _IS_WIN and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
-            try:
-                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-            except Exception:
-                pass
-        super().server_bind()
-
-
 def main():
     global _BIND_HOST
     ap = argparse.ArgumentParser()
@@ -4170,7 +4533,7 @@ def main():
     if args.host in ("0.0.0.0", "::", ""):
         print(f"CODEX WIRE local → http://localhost:{args.port}")
     start_rate_rpc_refresher()
-    CodexWireHTTPServer((args.host, args.port), H).serve_forever()
+    ThreadingHTTPServer((args.host, args.port), H).serve_forever()
 
 
 if __name__ == "__main__":
