@@ -56,7 +56,7 @@ def _load_monitor_env():
 _load_monitor_env()
 
 PORT = 8787
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.9.0"
 SESS = os.path.expanduser(os.environ.get("CODEX_MONITOR_SESS_DIR", "~/.codex/sessions"))
 HOME = os.path.expanduser("~")
 
@@ -76,6 +76,7 @@ RECENT_LIMIT = _env_int("CODEX_MONITOR_RECENT_LIMIT", 50)
 ACTIVE_STALE_SEC = _env_int("CODEX_MONITOR_STALE_SEC", 120)
 FEED_WINDOW_SEC = _env_int("CODEX_MONITOR_FEED_WINDOW_SEC", 1800)
 FEED_CAP = 80
+STAGE_ORDER = ("reading", "analyzing", "editing", "verifying", "starting", "idle")
 LONG_OP_GRACE_SEC = _env_int("CODEX_MONITOR_LONG_OP_GRACE_SEC", 180)
 TRACK_PATH = os.path.expanduser(os.environ.get("CODEX_MONITOR_TRACK_PATH", "~/.codex/codex_wire_jobs.json"))
 TRACK_TTL_SEC = _env_int("CODEX_MONITOR_TRACK_TTL_SEC", 7 * 24 * 3600)
@@ -2322,10 +2323,14 @@ def snapshot():
     cost_total = round(cost_total_raw, 4)
     # Counts only live rows derived from the current ps codex process list.
     status_counts = {k: 0 for k in ("running", "zombie", "error", "done", "killed", "interrupted")}
+    stage_counts = {k: 0 for k in STAGE_ORDER}
     for j in running:
         status = j["status"]
         if status in status_counts:
             status_counts[status] += 1
+        stage = j.get("stage")
+        if stage in stage_counts:
+            stage_counts[stage] += 1
     series = cost_series(now, session_files, session_stats)
     source_degraded = _ps_source_degraded()
     source_degraded.update(_storage_degraded())
@@ -2334,7 +2339,7 @@ def snapshot():
             "today_hours": today_hours, "rate": rate, "rate7d": rate7d,
             "rate_resets_at": rate_resets_at, "rate7d_resets_at": rate7d_resets_at,
             "rate_account": rate_account, "rate_plan": rate_plan, "rate_source": rate_source,
-            "stale_sec": ACTIVE_STALE_SEC, "status_counts": status_counts,
+            "stale_sec": ACTIVE_STALE_SEC, "status_counts": status_counts, "stage_counts": stage_counts,
             "token_total": token_total, "cost_total": cost_total, "cost_estimate": cost_estimate,
             "token_total_recent": token_total_recent, "cost_total_recent": cost_total_recent,
             "cost_series": series,
@@ -2348,6 +2353,10 @@ def _snapshot_shape(data):
     if not isinstance(counts, dict):
         counts = {}
     data["status_counts"] = {k: int(counts.get(k) or 0) for k in ("running", "zombie", "error", "done", "killed", "interrupted")}
+    stages = data.get("stage_counts")
+    if not isinstance(stages, dict):
+        stages = {}
+    data["stage_counts"] = {k: int(stages.get(k) or 0) for k in STAGE_ORDER}
     for key in ("running", "feed", "recent"):
         if not isinstance(data.get(key), list):
             data[key] = []
@@ -2658,16 +2667,21 @@ body.offline{filter:saturate(.4)}
   white-space:nowrap;box-shadow:0 6px 18px rgba(42,29,16,.18);pointer-events:none;opacity:0;visibility:hidden;
   transform:translate(-50%,-100%);transition:opacity .12s ease,transform .12s ease,visibility .12s ease}
 .hour-tip.show{opacity:1;visibility:visible;transform:translate(-50%,-116%)}
-.feed-row{display:flex;align-items:center;justify-content:space-between;gap:14px;min-height:48px}
-.feed-row .v{flex:1;min-width:0}
-.feed-ring{display:flex;flex:0 0 auto;flex-direction:column;align-items:center;justify-content:center;gap:3px;margin-top:-1px}
-.feed-ring svg{width:48px;height:48px;overflow:visible}
-.ring-track{fill:none;stroke:#ddcba8;stroke-width:4.5;opacity:.78}
-.ring-progress{fill:none;stroke:var(--wire);stroke-width:4.5;stroke-linecap:butt;transform:rotate(-90deg);
-  transform-origin:50% 50%;stroke-dasharray:100;stroke-dashoffset:100;transition:stroke-dashoffset .6s ease,stroke .2s ease}
-.ring-progress.rate-ok{stroke:var(--wire)}
-.ring-progress.rate-warn{stroke:var(--warn)}
-.mini-cap{color:var(--dim);font:500 10px "JetBrains Mono",monospace;font-variant-numeric:tabular-nums}
+.stage-tip{display:flex;align-items:center;gap:5px}
+.stage-tip i{display:inline-block;width:6px;height:6px;border-radius:50%;background:currentColor}
+.stage-row{display:flex;align-items:center;justify-content:space-between;gap:14px;min-height:48px}
+.stage-row .v{flex:1;min-width:0}
+.stage-ring{display:flex;flex:0 0 auto;align-items:center;justify-content:center;margin-top:-1px}
+.stage-ring svg{width:56px;height:56px;overflow:visible}
+.stage-track{fill:none;stroke:#ddcba8;stroke-width:14;opacity:.78}
+.stage-segment{fill:none;stroke-width:14;stroke-linecap:butt;transform:rotate(-90deg);
+  transform-origin:50% 50%;transition:stroke-dashoffset .6s ease,opacity .15s ease,filter .15s ease}
+.stage-segment:hover{opacity:.8;filter:drop-shadow(0 0 2px rgba(42,29,16,.26))}
+.stage-legend{display:flex;flex-wrap:wrap;gap:4px 8px;margin-top:5px;color:var(--dim);
+  font:600 9.5px/1.1 "JetBrains Mono",monospace;font-variant-numeric:tabular-nums}
+.stage-legend:empty{display:none}
+.stage-legend span{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+.stage-legend i{display:inline-block;width:6px;height:6px;border-radius:50%;background:currentColor}
 .onair{display:inline-flex;align-items:center;gap:9px}
 .lamp{width:11px;height:11px;border-radius:50%;background:#c3ad81}
 .lamp.on{background:var(--ember);animation:pulse 1.5s infinite}
@@ -2930,7 +2944,7 @@ footer{margin-top:40px;color:var(--faint);font-size:10.5px;border-top:1px solid 
 ::-webkit-scrollbar{width:7px;height:7px}::-webkit-scrollbar-thumb{background:#cf5915}::-webkit-scrollbar-track{background:transparent}
 @media(max-width:640px){
   body{padding-inline:12px}.brand{display:block}.mastmeta{justify-content:flex-start}.dateline{text-align:left}.controls input{min-width:100%}.controls input.mini{min-width:54px;width:54px;flex:0}.controls .switch input{min-width:0;width:1px;height:1px;flex:0}.refresh-note{margin-left:0;width:100%}
-  .stat{min-width:50%;border-bottom:1px solid #d3c096}.sec{gap:8px 10px;flex-wrap:wrap}.sec .rule{flex:1 1 48px}.recent-control{margin-left:0}.rec{display:grid;grid-template-columns:24px 54px minmax(0,1fr);gap:4px 8px;padding-right:8px;align-items:baseline}.rec .idx{width:24px;grid-column:1}.rec .ago{min-width:0;grid-column:2}.rec .src{min-width:0;grid-column:3}.rec .p{grid-column:1 / -1;white-space:normal;overflow-wrap:anywhere}.rec .n{grid-column:1 / -1}.acts{width:100%}.el{margin-left:0}.kv.prompt-head{max-width:100%;white-space:normal;overflow-wrap:anywhere}
+  .stat{min-width:50%;border-bottom:1px solid #d3c096}.stage-legend{display:none}.sec{gap:8px 10px;flex-wrap:wrap}.sec .rule{flex:1 1 48px}.recent-control{margin-left:0}.rec{display:grid;grid-template-columns:24px 54px minmax(0,1fr);gap:4px 8px;padding-right:8px;align-items:baseline}.rec .idx{width:24px;grid-column:1}.rec .ago{min-width:0;grid-column:2}.rec .src{min-width:0;grid-column:3}.rec .p{grid-column:1 / -1;white-space:normal;overflow-wrap:anywhere}.rec .n{grid-column:1 / -1}.acts{width:100%}.el{margin-left:0}.kv.prompt-head{max-width:100%;white-space:normal;overflow-wrap:anywhere}
 }
 @media(prefers-reduced-motion:reduce){
   html{scroll-behavior:auto}
@@ -2964,7 +2978,7 @@ footer{margin-top:40px;color:var(--faint);font-size:10.5px;border-top:1px solid 
       <div class=rate-line><span class=rate-tag>7D</span><span class=rate-val id=s_rate_7d>—<small>%</small></span><div class=gauge><i id=s_rate_7d_bar style=width:0%></i></div></div>
     </div>
   </div>
-  <div class=stat title="feed from sessions active in last 30m, capped at 80 lines"><div class=l>Wire feed</div><div class=feed-row><div class=v id=s_feed>—</div><div class=feed-ring title="0/80"><svg viewBox="0 0 48 48" aria-hidden=true><circle class=ring-track cx=24 cy=24 r=20></circle><circle id=s_feed_ring class="ring-progress rate-ok" cx=24 cy=24 r=20 pathLength=100></circle></svg><span id=s_feed_cap class=mini-cap>0/80</span></div></div></div>
+  <div class=stat title="running jobs by current stage"><div class=l>Stage</div><div class=stage-row><div class=v id=s_stage_total>—</div><div id=s_stage_ring class=stage-ring title="0 running"><svg viewBox="0 0 56 56" role=img aria-label="stage distribution"><circle class=stage-track cx=28 cy=28 r=20></circle><g id=s_stage_segments></g></svg></div></div><div id=s_stage_legend class=stage-legend></div></div>
 </div>
 
 <div class=costwrap id=costwrap>
@@ -3063,6 +3077,7 @@ function normalizeSnapshot(raw){
   d.recent=safeArray(d.recent);
   d.today_hours=safeArray(d.today_hours).slice(0,24);
   d.status_counts=safeObject(d.status_counts);
+  d.stage_counts=safeObject(d.stage_counts);
   d.source_degraded=safeObject(d.source_degraded);
   d.running.forEach((j,i)=>{if(j&&typeof j==='object'&&!stableId(j))j._stable_fallback='idx_'+i;});
   return d;
@@ -3099,7 +3114,8 @@ function formatRateReset(epoch, withDate=false){
   const hh=String(d.getHours()).padStart(2,'0'), mm=String(d.getMinutes()).padStart(2,'0');
   return withDate?`${d.getMonth()+1}/${d.getDate()} ${hh}:${mm}`:`${hh}:${mm}`;
 }
-const FEED_CAP=80;
+const STAGE_ORDER=['reading','analyzing','editing','verifying','starting','idle'];
+const STAGE_COLORS={reading:'var(--blue)',analyzing:'var(--wire)',editing:'var(--ember)',verifying:'var(--warn)',starting:'var(--violet)',idle:'var(--dim)'};
 let liveStatResizeObserver=null;
 function liveStatReadWidth(stack){
   return Math.max(58,stack.clientWidth||stack.getBoundingClientRect().width||146);
@@ -3226,18 +3242,67 @@ function hideHourTip(){if(hourTipEl)hourTipEl.classList.remove('show');}
 document.addEventListener('mouseover',e=>{const bar=e.target.closest&&e.target.closest('#s_today_hours i'); if(bar)showHourTip(bar);});
 document.addEventListener('mousemove',e=>{const bar=e.target.closest&&e.target.closest('#s_today_hours i'); if(bar&&hourTipEl&&hourTipEl.classList.contains('show'))moveHourTip(bar);});
 document.addEventListener('mouseout',e=>{const bar=e.target.closest&&e.target.closest('#s_today_hours i'); if(bar)hideHourTip();});
-function renderFeedGauge(feed){
-  const n=Array.isArray(feed)?feed.length:0, pct=Math.min(100,Math.max(0,n/FEED_CAP*100));
-  const ring=document.getElementById('s_feed_ring');
-  const feedWrap=ring?ring.closest('.feed-ring'):null;
-  if(feedWrap)feedWrap.style.display=n>0?'':'none';
-  if(ring){
-    ring.style.strokeDashoffset=(100-pct).toFixed(2);
-    ring.classList.remove('rate-ok','rate-warn','rate-bad');
-    ring.classList.add(pct>85?'rate-warn':'rate-ok');
-    const wrap=ring.closest('.feed-ring'); if(wrap)wrap.title=`${n}/${FEED_CAP}`;
+let stageTipEl=null;
+function stageTip(){
+  if(stageTipEl)return stageTipEl;
+  stageTipEl=document.createElement('div');
+  stageTipEl.className='hour-tip stage-tip';
+  stageTipEl.setAttribute('role','tooltip');
+  document.body.appendChild(stageTipEl);
+  return stageTipEl;
+}
+function moveStageTip(e){
+  const tip=stageTip();
+  tip.style.left=(e.pageX+10)+'px';
+  tip.style.top=(e.pageY-8)+'px';
+}
+function showStageTip(seg,e){
+  const tip=stageTip(), stage=seg.dataset.stage||'', count=seg.dataset.count||'0';
+  tip.innerHTML=`<i style="color:${seg.getAttribute('stroke')||'currentColor'}"></i><span></span>`;
+  tip.querySelector('span').textContent=`${stage}: ${count}`;
+  moveStageTip(e);
+  tip.classList.add('show');
+}
+function hideStageTip(){if(stageTipEl)stageTipEl.classList.remove('show');}
+function initStageTip(){
+  const segs=document.getElementById('s_stage_segments');
+  if(!segs||segs.dataset.tipReady)return;
+  segs.dataset.tipReady='1';
+  segs.addEventListener('mouseover',e=>{const seg=e.target.closest&&e.target.closest('.stage-segment'); if(seg)showStageTip(seg,e);});
+  segs.addEventListener('mousemove',e=>{const seg=e.target.closest&&e.target.closest('.stage-segment'); if(seg&&stageTipEl&&stageTipEl.classList.contains('show'))moveStageTip(e);});
+  segs.addEventListener('mouseout',e=>{const seg=e.target.closest&&e.target.closest('.stage-segment'); if(seg)hideStageTip();});
+}
+initStageTip();
+function renderStageCard(counts){
+  const data=(counts&&typeof counts==='object')?counts:{};
+  const parts=STAGE_ORDER.map(stage=>({stage,n:Math.max(0,Number(data[stage])||0)}));
+  const total=parts.reduce((sum,p)=>sum+p.n,0);
+  const wrap=document.getElementById('s_stage_ring');
+  const segs=document.getElementById('s_stage_segments');
+  const legend=document.getElementById('s_stage_legend');
+  setText(document.getElementById('s_stage_total'),total);
+  if(wrap){
+    wrap.style.display='';
+    wrap.title=total>0?parts.filter(p=>p.n>0).map(p=>`${p.stage}: ${p.n}`).join(' / '):'0 running';
+    const svg=wrap.querySelector('svg');
+    if(svg)svg.setAttribute('aria-label',total>0?`stage distribution, ${wrap.title}`:'stage distribution, 0 running');
   }
-  setText(document.getElementById('s_feed_cap'),`${n}/${FEED_CAP}`);
+  if(!segs)return;
+  if(total<=0){
+    segs.innerHTML='';
+    if(legend)legend.innerHTML='';
+    return;
+  }
+  let offset=0;
+  segs.innerHTML=parts.filter(p=>p.n>0).map(p=>{
+    const pct=p.n/total*100, dash=`${pct.toFixed(4)} ${(100-pct).toFixed(4)}`;
+    const html=`<circle class=stage-segment cx=28 cy=28 r=20 pathLength=100 stroke="${STAGE_COLORS[p.stage]}" stroke-dasharray="${dash}" stroke-dashoffset="${(-offset).toFixed(4)}" data-stage="${p.stage}" data-count="${p.n}" aria-label="${p.stage}: ${p.n}"></circle>`;
+    offset+=pct;
+    return html;
+  }).join('');
+  if(legend){
+    legend.innerHTML=parts.filter(p=>p.n>0).map(p=>`<span style="color:${STAGE_COLORS[p.stage]}"><i></i>${p.stage} ${p.n}</span>`).join('');
+  }
 }
 function renderRateLine(value, valueId, barId){
   const n=Number(value), ok=Number.isFinite(n);
@@ -3904,7 +3969,7 @@ async function tick(manual=false){
   setText(document.getElementById('s_run'),d.count); safeRender('renderLiveStat',()=>renderLiveStat(d,counts));
   setText(document.getElementById('s_today'),d.today); setText(document.getElementById('s_today_date'),d.today_date||'--/--'); safeRender('renderTodayHours',()=>renderTodayHours(d.today_hours));
   safeRender('renderRate',()=>renderRate(d));
-  setText(document.getElementById('s_feed'),d.feed.length); safeRender('renderFeedGauge',()=>renderFeedGauge(d.feed));
+  safeRender('renderStageCard',()=>renderStageCard(d.stage_counts));
   safeRender('renderCost',()=>renderCost(d));
   safeRender('renderControls',()=>renderControls(d));
   safeRender('renderCards',()=>renderCards());

@@ -8,6 +8,17 @@ for 0.x releases.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-06-26
+
+### Added
+
+- Added `stage_counts` to the `/api` snapshot, counting running jobs across `reading`, `analyzing`, `editing`, `verifying`, `starting`, and `idle` stages.
+- Added a segmented Stage distribution donut with stage-specific colors, hover tooltips, and a persistent idle track when no jobs are running.
+
+### Changed
+
+- Replaced the top Wire feed stat card with the Stage distribution card while keeping the Live Telegraph feed stream panel unchanged.
+
 ## [0.8.0] - 2026-06-26
 
 ### Performance
