@@ -8,6 +8,17 @@ for 0.x releases.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-26
+
+### Performance
+
+- Optimized `codex_monitor.py` backend hot paths while preserving dashboard output and `/api` values, including precompiled regexes, faster `ps` parsing, cached macOS process-argument handles, reduced session stat calls, fused snapshot counters, memoized pricing version, shared session discovery, single-pass cost bucketing, copy-on-write cost index handling, flatten memoization, shared cost grid data, and cached root HTML bytes.
+- Reduced frontend redraw work with signature-based render skipping for today hours, cost graphs, recent dispatches, structured card patches, live plates, and stale tick cleanup.
+
+### Changed
+
+- Released the behavior-preserving performance pass as the `0.6.0` minor update, keeping the existing screen contract and `/api` snapshot semantics unchanged.
+
 ## [0.5.3] - 2026-06-26
 
 ### Fixed
@@ -156,7 +167,8 @@ for 0.x releases.
 
 - Removed internal improvement notes from the public tree.
 
-[Unreleased]: https://github.com/part3917/codex-wire/compare/v0.5.3...HEAD
+[Unreleased]: https://github.com/part3917/codex-wire/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/part3917/codex-wire/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/part3917/codex-wire/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/part3917/codex-wire/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/part3917/codex-wire/compare/v0.5.0...v0.5.1

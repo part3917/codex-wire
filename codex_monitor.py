@@ -5,7 +5,7 @@ Sources (stdlib only, no deps):
   • `ps`                          → running codex exec jobs (pid, elapsed, cwd, sandbox)
   • ~/.codex/sessions/**/*.jsonl  → live activity: commands, file edits, agent messages, tokens
 """
-import argparse, copy, ctypes, datetime, glob, hashlib, json, math, os, queue, re, secrets, shlex, shutil, signal, struct, subprocess, sys, tempfile, threading, time, urllib.parse
+import argparse, ctypes, datetime, functools, glob, hashlib, json, math, os, queue, re, secrets, shlex, shutil, signal, struct, subprocess, sys, tempfile, threading, time, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -56,7 +56,7 @@ def _load_monitor_env():
 _load_monitor_env()
 
 PORT = 8787
-APP_VERSION = "0.5.3"
+APP_VERSION = "0.6.0"
 SESS = os.path.expanduser(os.environ.get("CODEX_MONITOR_SESS_DIR", "~/.codex/sessions"))
 HOME = os.path.expanduser("~")
 
@@ -106,6 +106,19 @@ _STORAGE_HEALTH_LOCK = threading.Lock()
 _RPC_RATE_CACHE = None
 _RPC_RATE_CACHE_LOCK = threading.Lock()
 _RPC_RATE_THREAD_STARTED = False
+_LIBC = None
+_LIBC_READY = False
+_MONITOR_SERVER_RE = re.compile(r"(^|\s)(python[0-9.]*|/.*/python[0-9.]*)\s+.*codex_monitor\.py(\s|$)")
+_CLASSIFY_JSON_RE = re.compile(r"parse|decode|unterminated|expecting value|extra data")
+_CLASSIFY_TIMEOUT_RE = re.compile(r"\b(timed?\s*out|timeout|deadline exceeded|curl:\s*\(28\))\b")
+_CLASSIFY_PERMISSION_RE = re.compile(r"\b(permission denied|operation not permitted|eacces|eperm|access is denied)\b")
+_CLASSIFY_NETWORK_RE = re.compile(r"\b(network|enotfound|econnreset|econnrefused|etimedout|dns|tls|ssl|fetch failed|curl:\s*\([567]\))\b")
+_CLASSIFY_SANDBOX_RE = re.compile(r"\b(sandbox|sandboxed|rejected\(|approval|not allowed|outside the sandbox)\b")
+_EXIT_CODE_RE = re.compile(r"Process exited with code\s+(-?\d+)")
+_STAGE_VERIFY_RE = re.compile(r"\b(test|pytest|lint|build|check|py_compile|tsc|vitest)\b")
+_STAGE_READ_RE = re.compile(r"\b(rg|sed|cat|ls|find|git show|git status|nl|wc)\b")
+_OUTPUT_STATUS_RE = re.compile(r"(?m)^\s*STATUS=(ok|timeout|error)\s*$")
+_PAGE_HTML_BYTES = None
 
 
 def _fsync_parent(path):
@@ -203,7 +216,7 @@ def _is_monitor_server(pid, args):
         ipid = -1
     if ipid in (os.getpid(), os.getppid()):
         return True
-    return bool(re.search(r"(^|\s)(python[0-9.]*|/.*/python[0-9.]*)\s+.*codex_monitor\.py(\s|$)", args))
+    return bool(_MONITOR_SERVER_RE.search(args))
 
 
 def _pid_alive(pid):
@@ -231,6 +244,26 @@ _BOOL_FLAGS = {
     "--dangerously-bypass-approvals-and-sandbox",
 }
 
+_NEXT_FLAG_RES = tuple(
+    re.compile(r"(?<!\S)" + re.escape(flag) + r"(?:=|\s|$)")
+    for flag in (_VALUE_FLAGS | _BOOL_FLAGS)
+)
+_RAW_FLAG_VALUE_RES = {
+    flag: re.compile(r"(?<!\S)" + re.escape(flag) + r"(?:=|\s+)")
+    for flag in _VALUE_FLAGS
+}
+
+
+def _libc():
+    global _LIBC, _LIBC_READY
+    if not _LIBC_READY:
+        try:
+            _LIBC = ctypes.CDLL(None)
+        except Exception:
+            _LIBC = None
+        _LIBC_READY = True
+    return _LIBC
+
 
 def _proc_argv(pid):
     """Return exact argv for a pid on macOS, preserving spaces inside args."""
@@ -241,7 +274,9 @@ def _proc_argv(pid):
     except Exception:
         return None
     try:
-        libc = ctypes.CDLL(None)
+        libc = _libc()
+        if libc is None:
+            return None
         mib = (ctypes.c_int * 3)(1, 49, ipid)  # CTL_KERN, KERN_PROCARGS2, pid
         size = ctypes.c_size_t(0)
         if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or size.value <= 0:
@@ -296,8 +331,8 @@ def _flag_value(argv, *flags):
 
 def _next_flag_index(text):
     matches = []
-    for flag in _VALUE_FLAGS | _BOOL_FLAGS:
-        m = re.search(r"(?<!\S)" + re.escape(flag) + r"(?:=|\s|$)", text)
+    for rx in _NEXT_FLAG_RES:
+        m = rx.search(text)
         if m:
             matches.append(m.start())
     return min(matches) if matches else len(text)
@@ -305,7 +340,8 @@ def _next_flag_index(text):
 
 def _raw_flag_value(args, *flags, want_dir=False):
     for flag in flags:
-        m = re.search(r"(?<!\S)" + re.escape(flag) + r"(?:=|\s+)", args)
+        rx = _RAW_FLAG_VALUE_RES.get(flag)
+        m = rx.search(args) if rx else re.search(r"(?<!\S)" + re.escape(flag) + r"(?:=|\s+)", args)
         if not m:
             continue
         value = args[m.end():_next_flag_index(args[m.end():]) + m.end()].strip()
@@ -374,31 +410,33 @@ def running_jobs(use_cache_on_failure=True):
             return _cached_ps_jobs()
         return []
     for ln in lines:
+        if "codex" not in ln or " exec" not in ln:
+            continue
         try:
             pid, etime, stat, args = ln.strip().split(None, 3)
         except ValueError:
             continue
         if "Z" in stat.upper():
             continue
-        if _is_monitor_server(pid, args):
-            continue
         if "codex" not in args or " exec" not in args:
             continue
         if "/codex" not in args and "@openai/codex" not in args and "codex-upstream" not in args:
             continue
+        if _is_monitor_server(pid, args):
+            continue
         argv = _proc_argv(pid) or _argv_from_ps(args)
         cwd = (_flag_value(argv, "-C", "--cd", "--cwd", "--directory") or
                _raw_flag_value(args, "-C", "--cd", "--cwd", "--directory", want_dir=True) or "?")
-        sandbox = (_flag_value(argv, "-s", "--sandbox") or
-                   _raw_flag_value(args, "-s", "--sandbox") or "?")
         out = (_flag_value(argv, "--output-last-message") or
                _raw_flag_value(args, "--output-last-message"))
         out = _normalize_out(out, cwd)
-        plabel = _codex_exec_prompt(argv)
         key = out or pid       # unique per dispatch: collapses wrapper/child, KEEPS parallel jobs
         if key in seen:
             continue
         seen.add(key)
+        sandbox = (_flag_value(argv, "-s", "--sandbox") or
+                   _raw_flag_value(args, "-s", "--sandbox") or "?")
+        plabel = _codex_exec_prompt(argv)
         jobs.append({"pid": pid, "elapsed": etime, "cwd": _short(cwd), "cwd_raw": cwd,
                      "sandbox": sandbox, "out": out, "plabel": plabel, "alive": _pid_alive(pid)})
     _set_ps_state(jobs=[dict(j) for j in jobs], degraded=False, error="", ts=time.time())
@@ -497,21 +535,21 @@ def _trim_output(out, limit=2400):
 
 
 def _exit_code(out):
-    m = re.search(r"Process exited with code\s+(-?\d+)", str(out or ""))
+    m = _EXIT_CODE_RE.search(str(out or ""))
     return int(m.group(1)) if m else None
 
 
 def _classify_error(output, exit_code=None, cmd=""):
     text = (str(output or "") + "\n" + str(cmd or "")).lower()
-    if "jsonl" in text or ("json" in text and re.search(r"parse|decode|unterminated|expecting value|extra data", text)):
+    if "jsonl" in text or ("json" in text and _CLASSIFY_JSON_RE.search(text)):
         return {"kind": "jsonl", "label": "JSONL"}
-    if re.search(r"\b(timed?\s*out|timeout|deadline exceeded|curl:\s*\(28\))\b", text):
+    if _CLASSIFY_TIMEOUT_RE.search(text):
         return {"kind": "timeout", "label": "TIMEOUT"}
-    if re.search(r"\b(permission denied|operation not permitted|eacces|eperm|access is denied)\b", text):
+    if _CLASSIFY_PERMISSION_RE.search(text):
         return {"kind": "permission", "label": "PERMISSION"}
-    if re.search(r"\b(network|enotfound|econnreset|econnrefused|etimedout|dns|tls|ssl|fetch failed|curl:\s*\([567]\))\b", text):
+    if _CLASSIFY_NETWORK_RE.search(text):
         return {"kind": "network", "label": "NETWORK"}
-    if re.search(r"\b(sandbox|sandboxed|rejected\(|approval|not allowed|outside the sandbox)\b", text):
+    if _CLASSIFY_SANDBOX_RE.search(text):
         return {"kind": "sandbox", "label": "SANDBOX"}
     if exit_code not in (None, 0):
         return {"kind": "exit", "label": f"EXIT {exit_code}"}
@@ -607,6 +645,29 @@ def _latest_active_rate(sessions, key, now):
     latest_reset = max(windows)
     latest = windows[latest_reset]
     return {"pct": latest["pct"], "resets_at": latest["resets_at"]}
+
+
+def _latest_active_rates(sessions, now):
+    windows_by_key = {"rate_primary": {}, "rate_secondary": {}}
+    for s in sessions:
+        for key, windows in windows_by_key.items():
+            sample = (s or {}).get(key) or {}
+            pct = _num(sample.get("pct"))
+            resets_at = _num(sample.get("resets_at"))
+            if pct is None or resets_at is None or resets_at <= now:
+                continue
+            rank = (resets_at, pct)
+            if resets_at not in windows or rank > windows[resets_at]["rank"]:
+                windows[resets_at] = {"rank": rank, "pct": pct, "resets_at": int(resets_at)}
+    out = {}
+    for key, windows in windows_by_key.items():
+        if not windows:
+            out[key] = None
+            continue
+        latest_reset = max(windows)
+        latest = windows[latest_reset]
+        out[key] = {"pct": latest["pct"], "resets_at": latest["resets_at"]}
+    return out["rate_primary"], out["rate_secondary"]
 
 
 def _codex_rpc_bin():
@@ -772,12 +833,13 @@ def start_rate_rpc_refresher():
     threading.Thread(target=_rpc_rate_refresh_loop, name="codex-rate-rpc", daemon=True).start()
 
 
-def parse_session(path):
+def parse_session(path, st=None):
     """Extract a rich summary + event stream from one rollout jsonl."""
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
+    if st is None:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
     s = {"file": path, "cwd": "", "prompt": "", "n_cmds": 0, "n_edits": 0,
          "files": [], "last_cmd": "", "last_msg": "", "rate_pct": None,
          "rate_primary": None, "rate_secondary": None,
@@ -896,18 +958,20 @@ def _mtime(path):
         return 0
 
 
-def _parse_session_files(files):
+def _parse_session_files(files, stat_map=None):
     out = []
     for f in files:
-        try:
-            st = os.stat(f)
-        except OSError:
-            continue
+        st = stat_map.get(f) if stat_map else None
+        if st is None:
+            try:
+                st = os.stat(f)
+            except OSError:
+                continue
         with _PARSE_CACHE_LOCK:
             ent = _PARSE_CACHE.get(f)
         if ent and ent[0] == st.st_mtime and ent[1] == st.st_size:
             out.append(ent[2]); continue          # unchanged → reuse cached summary
-        s = parse_session(f)
+        s = parse_session(f, st)
         if s is None:
             continue
         with _PARSE_CACHE_LOCK:
@@ -916,13 +980,37 @@ def _parse_session_files(files):
     return out
 
 
-def all_sessions(limit=SESSION_LIMIT):
+def _session_inventory():
     try:
         files = glob.glob(os.path.join(SESS, "**", "*.jsonl"), recursive=True)
     except Exception:
         files = []
-    files = sorted(files, key=_mtime, reverse=True)[:limit]
-    out = _parse_session_files(files)
+    stats = {}
+    for f in files:
+        try:
+            stats[f] = os.stat(f)
+        except OSError:
+            continue
+    return files, stats
+
+
+def _session_mtime(path, stat_map=None):
+    st = stat_map.get(path) if stat_map else None
+    if st is not None:
+        return st.st_mtime
+    return _mtime(path)
+
+
+def all_sessions(limit=SESSION_LIMIT, session_files=None, session_stats=None):
+    if session_files is None:
+        try:
+            files = glob.glob(os.path.join(SESS, "**", "*.jsonl"), recursive=True)
+        except Exception:
+            files = []
+    else:
+        files = list(session_files)
+    files = sorted(files, key=lambda f: _session_mtime(f, session_stats), reverse=True)[:limit]
+    out = _parse_session_files(files, session_stats)
     with _PARSE_CACHE_LOCK:
         if len(_PARSE_CACHE) > 320:                # evict entries no longer in window
             keep = set(files)
@@ -944,9 +1032,9 @@ def _stage(s, age_sec):
         if k == "err":
             return "verifying"
         if k == "cmd":
-            if re.search(r"\b(test|pytest|lint|build|check|py_compile|tsc|vitest)\b", t):
+            if _STAGE_VERIFY_RE.search(t):
                 return "verifying"
-            if re.search(r"\b(rg|sed|cat|ls|find|git show|git status|nl|wc)\b", t):
+            if _STAGE_READ_RE.search(t):
                 return "reading"
             return "analyzing"
         if k == "msg":
@@ -1104,7 +1192,7 @@ def _output_status(out):
             data = fh.read().decode("utf-8", "replace")
     except Exception:
         return None
-    matches = re.findall(r"(?m)^\s*STATUS=(ok|timeout|error)\s*$", data)
+    matches = _OUTPUT_STATUS_RE.findall(data)
     return matches[-1] if matches else None
 
 
@@ -1274,6 +1362,7 @@ _COST_INDEX_SAVE_LOCK = threading.Lock()
 _COST_INDEX_STATS = {"reused": 0, "parsed": 0, "rescanned": 0, "saved": False, "generation": 0}
 _SERIES_CACHE = {"ts": 0.0, "data": None, "sig": None, "generation": None, "pricing_version": None}
 _SERIES_CACHE_LOCK = threading.Lock()
+_COST_FLAT_CACHE = {"generation": None, "min_ts": None, "points": None}
 _COST_HEAD_SIG_BYTES = 64 * 1024
 _COST_RANGES = [                     # name, span seconds, bucket count
     ("5h",    5 * 3600,        30),
@@ -1285,6 +1374,7 @@ _COST_LABEL = {"5h": "5h session", "day": "last 24h", "week": "last 7 days",
                "month": "last 30 days", "year": "last 12 months"}
 
 
+@functools.lru_cache(maxsize=1)
 def _pricing_version():
     payload = {"default_model": DEFAULT_MODEL, "pricing": PRICING}
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1584,12 +1674,34 @@ def _cost_file_record(path, st, old=None, reset=False):
     return rec, changed, bool(reset), bool(severe)
 
 
-def _refresh_cost_index(entries):
+def _flatten_cost_points(index, generation, min_ts=None):
+    min_key = None if min_ts is None else float(min_ts)
+    if (_COST_FLAT_CACHE.get("points") is not None and
+            _COST_FLAT_CACHE.get("generation") == generation and
+            _COST_FLAT_CACHE.get("min_ts") == min_key):
+        return _COST_FLAT_CACHE["points"]
+    pts = []
+    for rec in (index.get("files") or {}).values():
+        for pt in rec.get("points") or []:
+            if not pt or not (pt.get("cost") or pt.get("total")):
+                continue
+            if min_ts is not None and pt["ts"] < min_ts:
+                continue
+            pts.append(pt)
+    _COST_FLAT_CACHE["generation"] = generation
+    _COST_FLAT_CACHE["min_ts"] = min_key
+    _COST_FLAT_CACHE["points"] = pts
+    return pts
+
+
+def _refresh_cost_index(entries, min_ts=None):
     global _COST_INDEX, _COST_INDEX_STATS
     _load_cost_index()
     with _COST_INDEX_LOCK:
         base_generation = int((_COST_INDEX or {}).get("generation") or 0)
-        index = copy.deepcopy(_COST_INDEX or _empty_cost_index())
+        base = _COST_INDEX or _empty_cost_index()
+        index = dict(base)
+        index["files"] = dict(base.get("files") or {})
     files = index.setdefault("files", {})
     seen = {path for path, _ in entries}
     dirty = False
@@ -1632,17 +1744,16 @@ def _refresh_cost_index(entries):
             stats["rescanned"] += 1
 
     if dirty:
-        save_index = copy.deepcopy(index)
-        save_index["generation"] = base_generation + 1
-        save_index["updated_at"] = time.time()
+        index["generation"] = base_generation + 1
+        index["updated_at"] = time.time()
         with _COST_INDEX_SAVE_LOCK:
             with _COST_INDEX_LOCK:
                 current_generation = int((_COST_INDEX or {}).get("generation") or 0)
-            if current_generation == base_generation and _save_cost_index(save_index):
+            if current_generation == base_generation and _save_cost_index(index):
                 with _COST_INDEX_LOCK:
                     if int((_COST_INDEX or {}).get("generation") or 0) == base_generation:
-                        _COST_INDEX = save_index
-                        stats["generation"] = int(save_index.get("generation") or 0)
+                        _COST_INDEX = index
+                        stats["generation"] = int(index.get("generation") or 0)
                         stats["saved"] = True
                     else:
                         stats["generation"] = int((_COST_INDEX or {}).get("generation") or 0)
@@ -1657,11 +1768,7 @@ def _refresh_cost_index(entries):
         final_index = _COST_INDEX if dirty and not stats["saved"] else index
         if stats["saved"]:
             final_index = _COST_INDEX
-        pts = []
-        for rec in (final_index.get("files") or {}).values():
-            for pt in rec.get("points") or []:
-                if pt and (pt.get("cost") or pt.get("total")):
-                    pts.append(pt)
+        pts = _flatten_cost_points(final_index, int(stats.get("generation") or 0), min_ts)
         _COST_INDEX_STATS = stats
     return pts, int(stats.get("generation") or 0), stats
 
@@ -1711,10 +1818,10 @@ def _cost_grid(name, now):
     return unit, n, _aligned_starts(now, unit, n)
 
 
-def _cost_axis(name, now):
+def _cost_axis(name, now, grid=None):
     """Time anchors for a range's x-axis: normalized x (0=oldest, 1=now) + label."""
     base = datetime.datetime.fromtimestamp(now)
-    grid = _cost_grid(name, now)
+    grid = grid if grid is not None else _cost_grid(name, now)
     if name == "5h":
         _, n, starts = grid
         out = []
@@ -1756,9 +1863,9 @@ def _cost_axis(name, now):
     return []
 
 
-def _cost_blabels(name, now):
+def _cost_blabels(name, now, grid=None):
     """Per-bucket hover labels for cost ranges, aligned to bucket starts."""
-    grid = _cost_grid(name, now)
+    grid = grid if grid is not None else _cost_grid(name, now)
     if name == "5h":
         return [datetime.datetime.fromtimestamp(ts).strftime("%H:%M") for ts in grid[2]]
     if name == "day":
@@ -1781,7 +1888,19 @@ def _cost_blabels(name, now):
     return []
 
 
-def cost_series(now):
+def _year_months(now):
+    base = datetime.datetime.fromtimestamp(now)
+    months, y, m = [], base.year, base.month
+    for _ in range(12):
+        months.append((y, m))
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    months.reverse()
+    return months
+
+
+def cost_series(now, session_files=None, session_stats=None):
     """Bucket token_count delta spend into rolling windows."""
     pricing_version = _pricing_version()
     with _SERIES_CACHE_LOCK:
@@ -1789,20 +1908,29 @@ def cost_series(now):
                 _SERIES_CACHE.get("pricing_version") == pricing_version):
             return _SERIES_CACHE["data"]
 
-    try:
-        files = sorted(glob.glob(os.path.join(SESS, "**", "*.jsonl"), recursive=True))
-    except Exception:
-        files = []
+    if session_files is None:
+        try:
+            files = sorted(glob.glob(os.path.join(SESS, "**", "*.jsonl"), recursive=True))
+        except Exception:
+            files = []
+    else:
+        files = sorted(session_files)
     entries, sig = [], []
     for f in files:
-        try:
-            st = os.stat(f)
-        except OSError:
-            continue
+        st = session_stats.get(f) if session_stats else None
+        if st is None:
+            try:
+                st = os.stat(f)
+            except OSError:
+                continue
         entries.append((f, st))
         sig.append(_file_sig(f, st))
 
-    pts, generation, _ = _refresh_cost_index(entries)
+    grids = {name: _cost_grid(name, now) for name, _, _ in _COST_RANGES}
+    months = _year_months(now)
+    month_index = {ym: i for i, ym in enumerate(months)}
+    min_ts = datetime.datetime(months[0][0], months[0][1], 1).timestamp()
+    pts, generation, _ = _refresh_cost_index(entries, min_ts)
     with _SERIES_CACHE_LOCK:
         if (_SERIES_CACHE["data"] is not None and (now - _SERIES_CACHE["ts"]) < 15 and
                 _SERIES_CACHE.get("sig") == sig and
@@ -1810,21 +1938,37 @@ def cost_series(now):
                 _SERIES_CACHE.get("pricing_version") == pricing_version):
             return _SERIES_CACHE["data"]
 
+    buckets = {}
+    for name, _, _ in _COST_RANGES:
+        unit, nb, starts = grids[name]
+        buckets[name] = {"unit": unit, "nb": nb, "starts": starts, "cost": [0.0] * nb, "tokens": 0}
+    ycost, ytok = [0.0] * 12, 0
+    for pt in pts:
+        ts = pt["ts"]
+        total = pt["total"]
+        cost_value = pt["cost"]
+        for name, bucket in buckets.items():
+            starts = bucket["starts"]
+            if ts < starts[0] or ts > now:
+                continue
+            i = int((ts - starts[0]) // bucket["unit"])
+            if 0 <= i < bucket["nb"]:
+                bucket["cost"][i] += cost_value
+                bucket["tokens"] += total
+        d = datetime.datetime.fromtimestamp(ts)
+        yi = month_index.get((d.year, d.month))
+        if yi is not None:
+            ycost[yi] += cost_value
+            ytok += total
+
     out = {}
     for name, _, _ in _COST_RANGES:
-        unit, nb, starts = _cost_grid(name, now)
-        cost, toks = [0.0] * nb, 0
-        for pt in pts:
-            if pt["ts"] < starts[0] or pt["ts"] > now:
-                continue
-            i = int((pt["ts"] - starts[0]) // unit)
-            if 0 <= i < nb:
-                cost[i] += pt["cost"]
-                toks += pt["total"]
+        bucket = buckets[name]
+        cost = bucket["cost"]
+        grid = grids[name]
         out[name] = {"label": _COST_LABEL[name], "points": [round(c, 4) for c in cost],
-                     "total": round(sum(cost), 4), "tokens": toks, "axis": _cost_axis(name, now),
-                     "blabels": _cost_blabels(name, now)}
-    ycost, ytok = _year_buckets(pts, now)
+                     "total": round(sum(cost), 4), "tokens": bucket["tokens"], "axis": _cost_axis(name, now, grid),
+                     "blabels": _cost_blabels(name, now, grid)}
     out["year"] = {"label": _COST_LABEL["year"], "points": [round(c, 4) for c in ycost],
                    "total": round(sum(ycost), 4), "tokens": ytok, "axis": _cost_axis("year", now),
                    "blabels": _cost_blabels("year", now)}
@@ -1840,7 +1984,7 @@ def cost_series(now):
 _ROLLOUT_HOUR_RE = re.compile(r"^rollout-\d{4}-\d{2}-\d{2}T(\d{2})-\d{2}-\d{2}")
 
 
-def _session_hour_buckets(paths):
+def _session_hour_buckets(paths, stat_map=None):
     hours = [0] * 24
     for path in paths:
         hour = None
@@ -1851,8 +1995,9 @@ def _session_hour_buckets(paths):
             except Exception:
                 hour = None
         if hour is None or not (0 <= hour <= 23):
+            st = stat_map.get(path) if stat_map else None
             try:
-                hour = time.localtime(os.path.getmtime(path)).tm_hour
+                hour = time.localtime(st.st_mtime if st is not None else os.path.getmtime(path)).tm_hour
             except Exception:
                 continue
         hours[hour] += 1
@@ -1861,8 +2006,9 @@ def _session_hour_buckets(paths):
 
 def snapshot():
     now = time.time()
+    session_files, session_stats = _session_inventory()
     jobs = running_jobs()
-    sessions = all_sessions(SESSION_LIMIT)
+    sessions = all_sessions(SESSION_LIMIT, session_files, session_stats)
     # enrich running jobs with their live session: match each job to the session whose
     # prompt matches this dispatch (so parallel agents in the same dir map to the RIGHT one)
     used = set()
@@ -1900,6 +2046,8 @@ def snapshot():
     for s in sessions:
         if id(s) in running_session_ids:
             continue
+        if len(recent) == RECENT_LIMIT:
+            break
         status, age_sec, activity = _status_for_session(s, False, False, now)
         status, activity = _apply_tracked_termination(status, activity, _track_for_session(s))
         recent.append({
@@ -1917,13 +2065,11 @@ def snapshot():
 
     today = time.strftime("%Y/%m/%d")
     today_date = f"{today[5:7]}/{today[8:10]} ({('Mon','Tue','Wed','Thu','Fri','Sat','Sun')[time.localtime().tm_wday]})"
-    try:
-        today_files = glob.glob(os.path.join(SESS, today, "*.jsonl"))
-    except Exception:
-        today_files = []
+    today_dir = os.path.join(SESS, today)
+    today_files = [f for f in session_files if os.path.dirname(f) == today_dir]
     today_n = len(today_files)
-    today_hours = _session_hour_buckets(today_files)
-    today_sessions = _parse_session_files(sorted(today_files, key=_mtime, reverse=True))
+    today_hours = _session_hour_buckets(today_files, session_stats)
+    today_sessions = _parse_session_files(sorted(today_files, key=lambda f: _session_mtime(f, session_stats), reverse=True), session_stats)
     rpc_rate = _active_rpc_rate(now)
     if rpc_rate:
         rate = float(rpc_rate["primary_pct"])
@@ -1934,8 +2080,7 @@ def snapshot():
         rate_account = rpc_rate.get("account_email")
         rate_plan = rpc_rate.get("plan_type")
     else:
-        primary_rate = _latest_active_rate(sessions, "rate_primary", now)
-        secondary_rate = _latest_active_rate(sessions, "rate_secondary", now)
+        primary_rate, secondary_rate = _latest_active_rates(sessions, now)
         rate = primary_rate.get("pct") if primary_rate else None
         rate7d = secondary_rate.get("pct") if secondary_rate else None
         rate_resets_at = primary_rate.get("resets_at") if primary_rate else None
@@ -1943,14 +2088,29 @@ def snapshot():
         rate_source = "jsonl"
         rate_account = None
         rate_plan = None
-    token_total_recent = sum((s.get("tokens") or {}).get("total", 0) for s in sessions)
-    cost_total_recent = round(sum((s.get("tokens") or {}).get("cost", 0.0) for s in sessions), 4)
-    token_total = sum((s.get("tokens") or {}).get("total", 0) for s in today_sessions)
-    cost_total = round(sum((s.get("tokens") or {}).get("cost", 0.0) for s in today_sessions), 4)
-    cost_estimate = any((s.get("tokens") or {}).get("cost_estimate") for s in today_sessions)
+    token_total_recent = 0
+    cost_total_recent_raw = 0.0
+    for s in sessions:
+        tokens = s.get("tokens") or {}
+        token_total_recent += tokens.get("total", 0)
+        cost_total_recent_raw += tokens.get("cost", 0.0)
+    cost_total_recent = round(cost_total_recent_raw, 4)
+    token_total = 0
+    cost_total_raw = 0.0
+    cost_estimate = False
+    for s in today_sessions:
+        tokens = s.get("tokens") or {}
+        token_total += tokens.get("total", 0)
+        cost_total_raw += tokens.get("cost", 0.0)
+        cost_estimate = cost_estimate or bool(tokens.get("cost_estimate"))
+    cost_total = round(cost_total_raw, 4)
     # Counts only live rows derived from the current ps codex process list.
-    status_counts = {k: sum(1 for j in running if j["status"] == k) for k in ("running", "zombie", "error", "done", "killed", "interrupted")}
-    series = cost_series(now)
+    status_counts = {k: 0 for k in ("running", "zombie", "error", "done", "killed", "interrupted")}
+    for j in running:
+        status = j["status"]
+        if status in status_counts:
+            status_counts[status] += 1
+    series = cost_series(now, session_files, session_stats)
     source_degraded = _ps_source_degraded()
     source_degraded.update(_storage_degraded())
     return {"ts": time.strftime("%H:%M:%S"), "date": time.strftime("%a %d %b %Y").upper(),
@@ -2079,8 +2239,15 @@ def _loopback_origin(value):
     return parsed.scheme in ("http", "https") and parsed.hostname in ("localhost", "127.0.0.1", "::1")
 
 
+def _page_html_bytes():
+    global _PAGE_HTML_BYTES
+    if _PAGE_HTML_BYTES is None:
+        _PAGE_HTML_BYTES = PAGE.replace("__CSRF_TOKEN__", CSRF_TOKEN).encode()
+    return _PAGE_HTML_BYTES
+
+
 def _page_html():
-    return PAGE.replace("__CSRF_TOKEN__", CSRF_TOKEN)
+    return _page_html_bytes().decode()
 
 
 def _parse_pid(value):
@@ -2717,15 +2884,46 @@ function formatRateReset(epoch, withDate=false){
   return withDate?`${d.getMonth()+1}/${d.getDate()} ${hh}:${mm}`:`${hh}:${mm}`;
 }
 const FEED_CAP=80;
+let liveStatResizeObserver=null;
+function liveStatReadWidth(stack){
+  return Math.max(58,stack.clientWidth||stack.getBoundingClientRect().width||146);
+}
+function liveStatWidthBucket(w){return String(Math.round((Number(w)||0)*100)/100);}
+function ensureLiveStatResize(stack){
+  if(!stack||stack.dataset.liveObserved)return;
+  stack.dataset.liveObserved='1';
+  const update=()=>{
+    const w=liveStatReadWidth(stack);
+    stack.dataset.liveWidth=String(w);
+    stack.dataset.liveWidthBucket=liveStatWidthBucket(w);
+    stack.dataset.sig='';
+  };
+  update();
+  if('ResizeObserver' in window){
+    stack.dataset.liveUsesRO='1';
+    liveStatResizeObserver=new ResizeObserver(update);
+    liveStatResizeObserver.observe(stack);
+  }
+}
 function renderLiveStat(d, counts){
   const stack=document.getElementById('s_run_stack'); if(!stack)return;
+  ensureLiveStatResize(stack);
   const count=Math.max(0,Math.floor(Number(d&&d.count)||0));
-  const W=Math.max(58,stack.clientWidth||stack.getBoundingClientRect().width||146);
+  let W=Number(stack.dataset.liveWidth)||liveStatReadWidth(stack);
+  if(stack.dataset.liveUsesRO!=='1'){
+    W=liveStatReadWidth(stack);
+    stack.dataset.liveWidth=String(W);
+    stack.dataset.liveWidthBucket=liveStatWidthBucket(W);
+  }
   const plateW=26, stepIdeal=16, plusReserve=24, hardCeiling=20;
   const fitFor=plusSpace=>Math.max(1,1+Math.floor((W-plateW-plusSpace)/stepIdeal));
   const maxFit0=fitFor(0);
   const maxFit=Math.min(hardCeiling,count>maxFit0?fitFor(plusReserve):maxFit0);
   const visible=Math.min(count,maxFit), overflow=Math.max(0,count-visible);
+  const widthBucket=stack.dataset.liveWidthBucket||liveStatWidthBucket(W);
+  const sig=count+'|'+widthBucket+'|'+overflow;
+  if(stack.dataset.sig===sig)return;
+  stack.dataset.sig=sig;
   const label=count===1?'1 live agent':`${count} live agents`;
   stack.setAttribute('aria-label',label);
   const wrap=stack.closest('.agent-stack-wrap'); if(wrap){wrap.title=label;wrap.style.display=count>0?'':'none';}
@@ -2778,6 +2976,9 @@ function renderTodayHours(hours){
   const vals=Array.isArray(hours)?hours.slice(0,24).map(v=>Math.max(0,Number(v)||0)):[];
   while(vals.length<24)vals.push(0);
   const max=Math.max.apply(null,vals.concat(1)), now=(new Date()).getHours();
+  const sig=vals.join(',')+'|'+now;
+  if(el.dataset.sig===sig)return;
+  el.dataset.sig=sig;
   el.innerHTML=vals.map((v,i)=>{
     const h=v?Math.max(4,Math.round((v/max)*14)):2;
     const cls=(v>0?' on':'')+(i===now?' now':'');
@@ -2911,6 +3112,11 @@ function renderCost(d){
   setText(document.getElementById('cost_peak'),'$'+Number(peak).toFixed(2));
   setText(document.getElementById('cost_estflag'),d.cost_estimate?' · est':'');
   _costHover={points:pts,peak:(pts.length?Math.max.apply(null,pts.concat(0)):0)||1,blabels:r.blabels||[]};
+  const axisKey=JSON.stringify(r.axis||null);
+  const graphSig=costRange+'|'+JSON.stringify(pts)+'|'+axisKey+'|'+peak;
+  const graphEl=document.getElementById('costgraph');
+  if(graphEl&&graphEl.dataset.sig===graphSig)return;
+  if(graphEl)graphEl.dataset.sig=graphSig;
   const p=costPath(pts);
   const lEl=document.getElementById('costline'),aEl=document.getElementById('costarea'),rEl=document.getElementById('costreveal');
   if(lEl){
@@ -3153,6 +3359,25 @@ function createCard(j){
   });
   patchCard(el,j); return el;
 }
+function patchCardTime(el,j){
+  const age=el.querySelector('.age');
+  if(age){age.className='kv age '+j.status;setText(age,'last '+fmtAge(j.last_age_sec));}
+  const elapsed=document.getElementById('el_'+j.pid);
+  if(elapsed)paintElapsed(elapsed,j.elapsed);
+}
+function msgClampSignature(el,k,j){
+  const box=el.querySelector('.msgbox');
+  if(!box)return '';
+  const width=Math.round((box.clientWidth||box.getBoundingClientRect().width||0)*100)/100;
+  return String(j.last_msg||'')+'|'+(msgOpen.has(k)?'1':'0')+'|'+width;
+}
+function scheduleMsgClampIfNeeded(el,k,j){
+  const sig=msgClampSignature(el,k,j);
+  if(!sig){el.dataset.msgClampSig='';return;}
+  if(el.dataset.msgClampSig===sig)return;
+  el.dataset.msgClampSig=sig;
+  requestAnimationFrame(()=>syncMsgClamp(el,k));
+}
 function patchCard(el,j){
   const k=stableId(j), pinned=pins.has(k), detailsOpen=expanded.has(k);
   el.dataset.key=j.key; el.dataset.stable=k; el.dataset.pid=j.pid||''; el.dataset.out=j.out||'';
@@ -3163,41 +3388,57 @@ function patchCard(el,j){
   const pidLabel=esc(j.pid||'job');
   const detailsId='details_'+domIdPart(k);
   const actionBtns=localActions?`<button data-act=retry aria-label="Retry Codex job ${pidLabel}">retry</button><button class=kill data-act=kill aria-label="Kill Codex job ${pidLabel}">kill</button>`:'';
-  setHTML(el,`<div class=hd>
+  const headBeforeTime=`
      <button class=details-toggle data-act=toggle type=button aria-controls="${detailsId}" aria-expanded="${detailsOpen?'true':'false'}" aria-label="${detailsOpen?'Collapse':'Expand'} details for Codex job ${pidLabel}">${detailsOpen?'less':'more'}</button>
      <span class="pill ${j.status}" title="${esc(j.status_label||j.status)}"><span class=d></span>${STATUS_ICON[j.status]||'·'} ${esc(statusDisplay(j))} ${esc(j.pid)}</span>
      <span class=kv>dir <b>${esc(j.cwd)}</b></span>
      <span class="kv prompt-head">${esc((j.prompt||'').replace(/\s+/g,' ').slice(0,90))}</span>
      <span class=chip>${esc(j.sandbox)}</span><span class=stage>${esc(j.stage)}</span>${activityHTML(j)}${errBadges(j)}
-     <span class="kv age ${j.status}">last ${fmtAge(j.last_age_sec)}</span>
-     <span class=el id=el_${esc(j.pid)}>${formatElapsedHTML(j.elapsed)}</span>
-     <span class=acts><button class="pinbtn ${pinned?'on':''}" data-act=pin title="${pinned?'unpin job':'pin job'}" aria-label="${pinned?'Unpin':'Pin'} Codex job ${pidLabel}" aria-pressed="${pinned?'true':'false'}">★</button><button data-act=copy aria-label="Copy last command for Codex job ${pidLabel}">copy cmd</button>${actionBtns}</span></div>
-    <div class=bd>${promptBlock(j)}
+     `;
+  const ageHTML=`<span class="kv age ${j.status}">last ${fmtAge(j.last_age_sec)}</span>`;
+  const elapsedHTML=`<span class=el id=el_${esc(j.pid)}>${formatElapsedHTML(j.elapsed)}</span>`;
+  const headAfterTime=`
+     <span class=acts><button class="pinbtn ${pinned?'on':''}" data-act=pin title="${pinned?'unpin job':'pin job'}" aria-label="${pinned?'Unpin':'Pin'} Codex job ${pidLabel}" aria-pressed="${pinned?'true':'false'}">★</button><button data-act=copy aria-label="Copy last command for Codex job ${pidLabel}">copy cmd</button>${actionBtns}</span>`;
+  const bodyHTML=`${promptBlock(j)}
      <div class=telem>${telem(j)}</div>
      ${files?`<div class=files>${files}</div>`:''}
      ${(j.events||[]).length?`<div class=minifeed>${feedHTML(j.events)}</div>`:''}
      ${msgBlock(j)}
-     ${detailsHTML(j)}
-    </div>`);
-  requestAnimationFrame(()=>syncMsgClamp(el,k));
+     ${detailsHTML(j)}`;
+  const structSig=JSON.stringify({
+    compact:document.body.classList.contains('compact'),
+    stable:k,pinned,detailsOpen,promptOpen:promptOpen.has(k),msgOpen:msgOpen.has(k),localActions,
+    status:j.status,headBeforeTime,headAfterTime,bodyHTML
+  });
+  if(el.dataset.structSig===structSig){
+    patchCardTime(el,j);
+    scheduleMsgClampIfNeeded(el,k,j);
+    return;
+  }
+  el.dataset.structSig=structSig;
+  setHTML(el,`<div class=hd>${headBeforeTime}${ageHTML}${elapsedHTML}${headAfterTime}</div>
+    <div class=bd>${bodyHTML}</div>`);
+  scheduleMsgClampIfNeeded(el,k,j);
 }
 function renderCards(){
-  const R=document.getElementById('running'), list=filteredRunning(), keep=new Set();
+  const R=document.getElementById('running'), list=filteredRunning(), keep=new Set(), keepPids=new Set();
   let empty=R.querySelector('.empty'); if(list.length&&empty)empty.remove();
   if(!list.length){
     [...R.children].forEach(ch=>{if(ch.classList.contains('card'))ch.remove();});
+    for(const pid in ticks)delete ticks[pid];
     const msg=(latest&&latest.running&&latest.running.length>0)?'NO MATCH — no jobs match the filters':'── NO DISPATCHES ON THE WIRE ──';
     if(!empty){empty=document.createElement('div');empty.className='empty';R.appendChild(empty);}
     setText(empty,msg);
     return;
   }
   for(const j of list){
-    const id=cardKey(j); keep.add(id);
+    const id=cardKey(j); keep.add(id); keepPids.add(String(j.pid));
     let el=document.getElementById(id);
     if(!el){el=createCard(j);} else {patchCard(el,j);}
     R.appendChild(el);
   }
   [...R.children].forEach(ch=>{if(ch.classList.contains('card')&&!keep.has(ch.id))ch.remove();});
+  for(const pid in ticks){if(!keepPids.has(String(pid)))delete ticks[pid];}
 }
 function renderWire(feed){
   const W=document.getElementById('wire');
@@ -3259,8 +3500,14 @@ function renderRecent(rows){
   rows=safeArray(rows);
   const total=Math.min(rows.length,RECENT_MAX), shown=Math.min(recentN,total);
   syncRecentSelect(rows.length);
-  if(!total){setHTML(RE,emptyHTML('── LOGBOOK EMPTY ──'));return;}
-  const oldList=RE.querySelector('.recent-list'), oldHeight=oldList?oldList.getBoundingClientRect().height:0;
+  const sel=document.getElementById('recent_limit');
+  if(!total){
+    const html=emptyHTML('── LOGBOOK EMPTY ──');
+    const sig=JSON.stringify({recentN,recentRevealFrom,total,shown,rows:rows.length,select:sel?[sel.value,sel.disabled,sel.title]:null,html});
+    if(recentRevealFrom==null&&RE.dataset.sig===sig)return;
+    RE.dataset.sig=sig;
+    setHTML(RE,html);return;
+  }
   const recs=rows.slice(0,shown).map((s,i)=>`<div class="rec ${s.status}">
      <span class=idx>${i+1}</span><span class=ago>${fmtRecentAge(s.age_min)}</span><span class=src>${esc(s.cwd)}</span>
      <span class=p>${esc(s.prompt)}</span>
@@ -3269,7 +3516,12 @@ function renderRecent(rows){
   const canCollapse=shown>RECENT_STEP&&!hasMore;
   const more=hasMore?`<div class=recent-more><div class=recent-fade></div><button class=recent-continued data-recent-more type=button aria-label="Show 10 more dispatches, ${total-shown} remaining" aria-expanded="false" title="show 10 more"><span class=recent-chevron>${recentChevron('down')}</span><span class=label>SHOW 10 MORE</span><span class=remain>· ${total-shown} more</span></button></div>`:'';
   const collapse=canCollapse?`<div class=recent-collapse><button class=recent-continued data-recent-collapse type=button aria-label="Collapse recent dispatches" aria-expanded="true" title="collapse to 10"><span class=recent-chevron>${recentChevron('up')}</span><span class=label>COLLAPSE</span></button></div>`:'';
-  setHTML(RE,`<div class=recent-list>${recs}</div>${more}${collapse}`);
+  const html=`<div class=recent-list>${recs}</div>${more}${collapse}`;
+  const sig=JSON.stringify({recentN,recentRevealFrom,total,shown,rows:rows.length,select:sel?[sel.value,sel.disabled,sel.title]:null,html});
+  if(recentRevealFrom==null&&RE.dataset.sig===sig)return;
+  const oldList=RE.querySelector('.recent-list'), oldHeight=oldList?oldList.getBoundingClientRect().height:0;
+  RE.dataset.sig=sig;
+  setHTML(RE,html);
   const list=RE.querySelector('.recent-list'), newHeight=list?list.scrollHeight:0;
   if(list&&oldHeight&&Math.abs(newHeight-oldHeight)>1){
     list.style.maxHeight=oldHeight+'px';
@@ -3460,7 +3712,7 @@ async function tick(manual=false){
  }
 }
 function startPoll(){if(timer)clearInterval(timer);timer=setInterval(tick,pollMs);}
-setInterval(()=>{for(const pid in ticks){const el=document.getElementById('el_'+pid);if(!el)continue;
+setInterval(()=>{for(const pid in ticks){const el=document.getElementById('el_'+pid);if(!el){delete ticks[pid];continue;}
   let p=ticks[pid].split(':').map(Number);let s=p.pop()+1;let m=p.pop()||0;let h=p.pop()||0;
   if(s>59){s=0;m++;}if(m>59){m=0;h++;}
   ticks[pid]=(h?String(h).padStart(2,'0')+':':'')+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
@@ -3527,7 +3779,7 @@ class H(BaseHTTPRequestHandler):
             body = json.dumps(data, ensure_ascii=False).encode()
             self._send(200, body, "application/json; charset=utf-8")
         else:
-            self._send(200, _page_html().encode(), "text/html; charset=utf-8")
+            self._send(200, _page_html_bytes(), "text/html; charset=utf-8")
     def do_POST(self):
         if not _local_client(self):
             body = json.dumps({"ok": False, "error": "POST actions are localhost-only"}).encode()
