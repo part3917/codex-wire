@@ -8,6 +8,13 @@ for 0.x releases.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-26
+
+### Performance
+
+- Added append-only incremental parsing for active session JSONL files, reusing cached parse state when file identity, size growth, and the head signature prove the log only grew.
+- Preserved full reparse fallbacks for truncation, rewrite, head mismatch, malformed or incomplete records, identity changes, and platforms without reliable device/inode identity.
+
 ## [0.7.0] - 2026-06-26
 
 ### Performance

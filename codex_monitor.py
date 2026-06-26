@@ -5,7 +5,7 @@ Sources (stdlib only, no deps):
   • `ps`                          → running codex exec jobs (pid, elapsed, cwd, sandbox)
   • ~/.codex/sessions/**/*.jsonl  → live activity: commands, file edits, agent messages, tokens
 """
-import argparse, ctypes, datetime, functools, glob, hashlib, json, math, os, queue, re, secrets, shlex, shutil, signal, struct, subprocess, sys, tempfile, threading, time, urllib.parse
+import argparse, copy, ctypes, datetime, functools, glob, hashlib, json, math, os, queue, re, secrets, shlex, shutil, signal, struct, subprocess, sys, tempfile, threading, time, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -56,7 +56,7 @@ def _load_monitor_env():
 _load_monitor_env()
 
 PORT = 8787
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.8.0"
 SESS = os.path.expanduser(os.environ.get("CODEX_MONITOR_SESS_DIR", "~/.codex/sessions"))
 HOME = os.path.expanduser("~")
 
@@ -445,9 +445,10 @@ def running_jobs(use_cache_on_failure=True):
     return jobs
 
 
-_PARSE_CACHE = {}            # path -> (mtime, size, summary) — skip re-parsing unchanged files
+_PARSE_CACHE = {}            # path -> cache entry; unchanged files skip re-parsing
 _PARSE_CACHE_LOCK = threading.Lock()
 _BIG = 8 * 1024 * 1024       # cache boundary retained; large files stream fully on cache miss
+_PARSE_HEAD_SIG_BYTES = 64 * 1024
 _EVENT_TAIL_MAX = 64
 _OUTPUT_TAIL_MAX = 8
 _ERROR_TAIL_MAX = 8
@@ -918,13 +919,25 @@ def start_rate_rpc_refresher():
     threading.Thread(target=_rpc_rate_refresh_loop, name="codex-rate-rpc", daemon=True).start()
 
 
-def parse_session(path, st=None):
-    """Extract a rich summary + event stream from one rollout jsonl."""
-    if st is None:
-        try:
-            st = os.stat(path)
-        except OSError:
-            return None
+def _stat_identity(st):
+    try:
+        dev, ino = int(st.st_dev), int(st.st_ino)
+    except Exception:
+        return None
+    if not dev or not ino:
+        return None
+    return dev, ino
+
+
+def _head_signature(path, limit=_PARSE_HEAD_SIG_BYTES):
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read(limit)).hexdigest()
+    except Exception:
+        return None
+
+
+def _new_parse_state(path, st):
     s = {"file": path, "cwd": "", "prompt": "", "n_cmds": 0, "n_edits": 0,
          "files": [], "last_cmd": "", "last_msg": "", "rate_pct": None,
          "rate_primary": None, "rate_secondary": None,
@@ -934,92 +947,130 @@ def parse_session(path, st=None):
          "events": [], "model": "", "outputs": [], "errors": [],
          "truncated": False,
          "tokens": {"input": 0, "cached": 0, "output": 0, "reasoning": 0, "total": 0, "cost": 0.0}}
-    files, exec_calls, parse_errors = set(), {}, []
-    for o in _iter(path, st.st_size, parse_errors):
-        try:
-            if not isinstance(o, dict):
-                continue
-            p = o.get("payload", {}) or {}
-            if not isinstance(p, dict):
-                _add_parse_error(parse_errors, "jsonl schema: payload is not an object")
-                continue
-            ts = o.get("timestamp", "")
-            ets = _epoch(ts)
-            if ets:
-                s["last_ts"] = max(s["last_ts"], ets)
-                if s["last_event_epoch"] is None or ets > s["last_event_epoch"]:
-                    s["last_event_epoch"] = ets
-                    s["last_event_ts"] = ts
-            otype, ptype = o.get("type"), p.get("type", "")
-            if otype == "session_meta" or ("cwd" in p and not s["cwd"]):
-                s["cwd"] = p.get("cwd", s["cwd"]); s["model"] = (p.get("model") or o.get("model") or s["model"])
-            elif ptype == "task_started":
-                s["started"] = p.get("started_at"); s["ctx_window"] = p.get("model_context_window")
-            elif ptype == "user_message":
-                s["prompt"] = (p.get("message") or "")[:5000]
-            elif ptype == "agent_message":
-                m = (p.get("message") or "").strip()
-                if m:
-                    s["last_msg"] = m
-                    _event(s["events"], ts, "msg", m, True)
-            elif ptype == "function_call" and p.get("name") == "exec_command":
-                try:
-                    args = json.loads(p.get("arguments", "{}"))
-                    cmd = args.get("cmd", "")
-                except Exception:
-                    cmd = p.get("arguments", "")
-                cmd = re.sub(r"\s+", " ", str(cmd)).strip()
-                if cmd:
-                    s["n_cmds"] += 1; s["last_cmd"] = cmd
-                    if p.get("call_id"):
-                        exec_calls[p.get("call_id")] = {"cmd": cmd, "ts": ts, "epoch": ets}
-                    _event(s["events"], ts, "cmd", cmd[:240], False)
-            elif ptype == "function_call_output":
-                out = str(p.get("output", ""))
-                call_id = p.get("call_id")
-                call = exec_calls.pop(call_id, None) if call_id else None
-                if call or out.startswith("Chunk ID:"):
-                    code = _exit_code(out)
-                    cmd = (call or {}).get("cmd") if isinstance(call, dict) else (call or s["last_cmd"])
-                    entry = {"ts": ts, "cmd": cmd, "exit_code": code, "output": _trim_output(out)}
-                    s["outputs"].append(entry)
-                    _trim_tail_in_place(s["outputs"], _OUTPUT_TAIL_MAX)
-                    if code not in (None, 0):
-                        err = _error_entry(ts, entry["cmd"], code, entry["output"])
-                        s["errors"].append(err)
-                        _trim_tail_in_place(s["errors"], _ERROR_TAIL_MAX)
-                        _event(s["events"], ts, "err", f"{err['label']}: {entry['cmd']}", True)
-                    else:
-                        _event(s["events"], ts, "out", entry["cmd"], False)
-            elif ptype == "custom_tool_call" and p.get("name") == "apply_patch":
-                s["n_edits"] += 1
-                _event(s["events"], ts, "edit", "apply_patch", True)
-            elif ptype == "custom_tool_call_output":
-                output = str(p.get("output", ""))
-                for m in re.finditer(r"[AM]\s+(\S+)", output):
-                    files.add(os.path.basename(m.group(1)))
-                if "error" in output.lower() or "failed" in output.lower():
-                    err = _error_entry(ts, "apply_patch", None, output)
+    return {"summary": s, "files": set(), "exec_calls": {}, "parse_errors": [], "safe_offset": 0}
+
+
+def _apply_session_record(state, o):
+    s = state["summary"]
+    files = state["files"]
+    exec_calls = state["exec_calls"]
+    parse_errors = state["parse_errors"]
+    try:
+        if not isinstance(o, dict):
+            return
+        p = o.get("payload", {}) or {}
+        if not isinstance(p, dict):
+            _add_parse_error(parse_errors, "jsonl schema: payload is not an object")
+            return
+        ts = o.get("timestamp", "")
+        ets = _epoch(ts)
+        if ets:
+            s["last_ts"] = max(s["last_ts"], ets)
+            if s["last_event_epoch"] is None or ets > s["last_event_epoch"]:
+                s["last_event_epoch"] = ets
+                s["last_event_ts"] = ts
+        otype, ptype = o.get("type"), p.get("type", "")
+        if otype == "session_meta" or ("cwd" in p and not s["cwd"]):
+            s["cwd"] = p.get("cwd", s["cwd"]); s["model"] = (p.get("model") or o.get("model") or s["model"])
+        elif ptype == "task_started":
+            s["started"] = p.get("started_at"); s["ctx_window"] = p.get("model_context_window")
+        elif ptype == "user_message":
+            s["prompt"] = (p.get("message") or "")[:5000]
+        elif ptype == "agent_message":
+            m = (p.get("message") or "").strip()
+            if m:
+                s["last_msg"] = m
+                _event(s["events"], ts, "msg", m, True)
+        elif ptype == "function_call" and p.get("name") == "exec_command":
+            try:
+                args = json.loads(p.get("arguments", "{}"))
+                cmd = args.get("cmd", "")
+            except Exception:
+                cmd = p.get("arguments", "")
+            cmd = re.sub(r"\s+", " ", str(cmd)).strip()
+            if cmd:
+                s["n_cmds"] += 1; s["last_cmd"] = cmd
+                if p.get("call_id"):
+                    exec_calls[p.get("call_id")] = {"cmd": cmd, "ts": ts, "epoch": ets}
+                _event(s["events"], ts, "cmd", cmd[:240], False)
+        elif ptype == "function_call_output":
+            out = str(p.get("output", ""))
+            call_id = p.get("call_id")
+            call = exec_calls.pop(call_id, None) if call_id else None
+            if call or out.startswith("Chunk ID:"):
+                code = _exit_code(out)
+                cmd = (call or {}).get("cmd") if isinstance(call, dict) else (call or s["last_cmd"])
+                entry = {"ts": ts, "cmd": cmd, "exit_code": code, "output": _trim_output(out)}
+                s["outputs"].append(entry)
+                _trim_tail_in_place(s["outputs"], _OUTPUT_TAIL_MAX)
+                if code not in (None, 0):
+                    err = _error_entry(ts, entry["cmd"], code, entry["output"])
                     s["errors"].append(err)
                     _trim_tail_in_place(s["errors"], _ERROR_TAIL_MAX)
-                    _event(s["events"], ts, "err", f"{err['label']}: apply_patch", True)
-            elif ptype == "token_count":
-                rate_limits = p.get("rate_limits") or {}
-                primary = _rate_sample(rate_limits.get("primary") or {}, ts, ets)
-                if primary is not None:
-                    s["rate_primary"] = primary
-                    s["rate_pct"] = primary["pct"]
-                secondary = _rate_sample(rate_limits.get("secondary") or {}, ts, ets)
-                if secondary is not None:
-                    s["rate_secondary"] = secondary
-                info = p.get("info") or {}
-                if info:
-                    s["model"] = (p.get("model") or info.get("model") or info.get("model_name") or s.get("model") or DEFAULT_MODEL)
-                    s["tokens"] = _normalize_usage(info, s["model"])
-                    if info.get("model_context_window"):
-                        s["ctx_window"] = info.get("model_context_window")
-        except Exception as e:
-            _add_parse_error(parse_errors, f"jsonl schema: {e}")
+                    _event(s["events"], ts, "err", f"{err['label']}: {entry['cmd']}", True)
+                else:
+                    _event(s["events"], ts, "out", entry["cmd"], False)
+        elif ptype == "custom_tool_call" and p.get("name") == "apply_patch":
+            s["n_edits"] += 1
+            _event(s["events"], ts, "edit", "apply_patch", True)
+        elif ptype == "custom_tool_call_output":
+            output = str(p.get("output", ""))
+            for m in re.finditer(r"[AM]\s+(\S+)", output):
+                files.add(os.path.basename(m.group(1)))
+            if "error" in output.lower() or "failed" in output.lower():
+                err = _error_entry(ts, "apply_patch", None, output)
+                s["errors"].append(err)
+                _trim_tail_in_place(s["errors"], _ERROR_TAIL_MAX)
+                _event(s["events"], ts, "err", f"{err['label']}: apply_patch", True)
+        elif ptype == "token_count":
+            rate_limits = p.get("rate_limits") or {}
+            primary = _rate_sample(rate_limits.get("primary") or {}, ts, ets)
+            if primary is not None:
+                s["rate_primary"] = primary
+                s["rate_pct"] = primary["pct"]
+            secondary = _rate_sample(rate_limits.get("secondary") or {}, ts, ets)
+            if secondary is not None:
+                s["rate_secondary"] = secondary
+            info = p.get("info") or {}
+            if info:
+                s["model"] = (p.get("model") or info.get("model") or info.get("model_name") or s.get("model") or DEFAULT_MODEL)
+                s["tokens"] = _normalize_usage(info, s["model"])
+                if info.get("model_context_window"):
+                    s["ctx_window"] = info.get("model_context_window")
+    except Exception as e:
+        _add_parse_error(parse_errors, f"jsonl schema: {e}")
+
+
+def _consume_jsonl_range(path, state, size=None, start=0, incremental=False):
+    safe_offset = start
+    try:
+        with open(path, "rb") as fh:
+            if size is None:
+                fh.seek(0, os.SEEK_END); size = fh.tell()
+            fh.seek(start)
+            while fh.tell() < size:
+                raw = fh.readline()
+                if not raw:
+                    break
+                end = fh.tell()
+                complete = raw.endswith(b"\n")
+                if incremental and not complete:
+                    return False, safe_offset
+                obj = _jsonl_obj(raw, state["parse_errors"])
+                if complete:
+                    safe_offset = end
+                if obj is not None:
+                    _apply_session_record(state, obj)
+    except Exception:
+        return True, safe_offset
+    return True, safe_offset
+
+
+def _finalize_parse_state(state):
+    s = state["summary"]
+    files = state["files"]
+    exec_calls = state["exec_calls"]
+    parse_errors = state["parse_errors"]
     if parse_errors:
         err = _error_entry("", "jsonl parser", None, "JSONL parse damage: " + "; ".join(parse_errors))
         s["errors"].append(err)
@@ -1034,6 +1085,86 @@ def parse_session(path, st=None):
     s["outputs"] = s["outputs"][-5:]
     s["errors"] = s["errors"][-5:]
     return s
+
+
+def _parse_session_state(path, st):
+    state = _new_parse_state(path, st)
+    ok, safe_offset = _consume_jsonl_range(path, state, st.st_size, 0, incremental=False)
+    if not ok:
+        return None
+    state["safe_offset"] = safe_offset
+    _finalize_parse_state(state)
+    return state
+
+
+def parse_session(path, st=None):
+    """Extract a rich summary + event stream from one rollout jsonl."""
+    if st is None:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+    state = _parse_session_state(path, st)
+    return state["summary"] if state else None
+
+
+def _parse_cache_entry(path, st, state):
+    ident = _stat_identity(st)
+    head_sig_len = min(int(st.st_size), _PARSE_HEAD_SIG_BYTES)
+    return {
+        "mtime": st.st_mtime,
+        "size": st.st_size,
+        "dev": ident[0] if ident else None,
+        "ino": ident[1] if ident else None,
+        "head_sig": _head_signature(path, head_sig_len) if ident else None,
+        "head_sig_len": head_sig_len,
+        "safe_offset": state.get("safe_offset", 0),
+        "summary": state["summary"],
+        "state": state,
+    }
+
+
+def _full_parse_cache_entry(path, st):
+    state = _parse_session_state(path, st)
+    if state is None:
+        return None
+    return _parse_cache_entry(path, st, state)
+
+
+def _parse_cache_hit(ent, st):
+    return (isinstance(ent, dict) and ent.get("mtime") == st.st_mtime and
+            ent.get("size") == st.st_size and ent.get("summary") is not None)
+
+
+def _incremental_parse_cache_entry(path, st, ent):
+    if not isinstance(ent, dict):
+        return None
+    ident = _stat_identity(st)
+    if ident is None or ent.get("dev") != ident[0] or ent.get("ino") != ident[1]:
+        return None
+    old_size = ent.get("size")
+    if not isinstance(old_size, int) or st.st_size <= old_size:
+        return None
+    if ent.get("safe_offset") != old_size:
+        return None
+    head_sig_len = ent.get("head_sig_len")
+    if not isinstance(head_sig_len, int) or not ent.get("head_sig"):
+        return None
+    if _head_signature(path, head_sig_len) != ent.get("head_sig"):
+        return None
+    cached_state = ent.get("state")
+    if not isinstance(cached_state, dict) or cached_state.get("parse_errors"):
+        return None
+    state = copy.deepcopy(cached_state)
+    state["summary"]["last_ts"] = max(state["summary"].get("last_ts") or st.st_mtime, st.st_mtime)
+    ok, safe_offset = _consume_jsonl_range(path, state, st.st_size, old_size, incremental=True)
+    if not ok or state.get("parse_errors"):
+        return None
+    state["safe_offset"] = safe_offset
+    _finalize_parse_state(state)
+    if state.get("safe_offset") != st.st_size:
+        return None
+    return _parse_cache_entry(path, st, state)
 
 
 def _mtime(path):
@@ -1054,14 +1185,14 @@ def _parse_session_files(files, stat_map=None):
                 continue
         with _PARSE_CACHE_LOCK:
             ent = _PARSE_CACHE.get(f)
-        if ent and ent[0] == st.st_mtime and ent[1] == st.st_size:
-            out.append(ent[2]); continue          # unchanged → reuse cached summary
-        s = parse_session(f, st)
-        if s is None:
+        if _parse_cache_hit(ent, st):
+            out.append(ent["summary"]); continue  # unchanged → reuse cached summary
+        ent = _incremental_parse_cache_entry(f, st, ent) or _full_parse_cache_entry(f, st)
+        if ent is None:
             continue
         with _PARSE_CACHE_LOCK:
-            _PARSE_CACHE[f] = (st.st_mtime, st.st_size, s)
-        out.append(s)
+            _PARSE_CACHE[f] = ent
+        out.append(ent["summary"])
     return out
 
 
