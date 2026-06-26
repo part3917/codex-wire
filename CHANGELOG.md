@@ -8,6 +8,31 @@ for 0.x releases.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-26
+
+### Added
+
+- Added live Codex JSON-RPC rate-limit reads through `account/rateLimits/read`, with a 45-second background cache and `account/read` account metadata.
+- Added `rate_account`, `rate_plan`, `rate_source`, `rate_resets_at`, and `rate7d_resets_at` fields to the `/api` snapshot.
+- Added simultaneous `5H` and `7D` rate-limit lines with reset times in the Rate card header.
+- Added clone-local `.env` loading for `CODEX_MONITOR_*` settings and documented `CODEX_MONITOR_COST_INDEX_PATH`.
+- Added localhost-only POST hardening with Host, Origin, Content-Type, body-size, and CSRF checks.
+
+### Changed
+
+- Replaced JSONL-first rate-limit reporting with live Codex RPC values so the dashboard matches Codex's authoritative account state.
+- Improved JSONL rate fallback to prefer the maximum active `used_percent` within each live reset window, reducing spurious zero and stale-session readings.
+- Improved dispatch output by printing machine-readable `STATUS`, `OUT`, and `LOG` headers.
+- Improved large-session parsing, parser cache safety, storage error reporting, API fallback shape, polling timeouts, and frontend state normalization.
+- Updated the rate source to show JSONL only as a fallback when live RPC data is unavailable.
+
+### Fixed
+
+- Fixed Rate card staleness caused by new-session JSONL samples reporting misleading zero usage.
+- Fixed retry and kill actions with stricter local-only request handling and CSRF-protected POSTs.
+- Fixed dispatch cleanup so it avoids signaling its own process group, validates cwd and timeout inputs, and waits for stable summary output before stopping.
+- Fixed Recent Dispatches and Live Telegraph rendering edge cases for malformed or overflowing data.
+
 ## [0.3.0] - 2026-06-20
 
 ### Added
@@ -94,7 +119,8 @@ for 0.x releases.
 
 - Removed internal improvement notes from the public tree.
 
-[Unreleased]: https://github.com/part3917/codex-wire/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/part3917/codex-wire/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/part3917/codex-wire/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/part3917/codex-wire/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/part3917/codex-wire/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/part3917/codex-wire/releases/tag/v0.1.0

@@ -46,7 +46,7 @@ The panel includes:
 | **Horizontal grid** | Dynamic "nice" dollar gridlines based on the current peak bucket. |
 | **Time axis** | Vertical guide marks and labels for the selected window, including `now` where applicable. |
 | **Hover detail** | Mouse hover shows a vertical guide line, point marker, and tooltip with the bucket time plus dollar amount. |
-| **`est` / `est:fallback`** | `est` means the amount is an estimate derived from token usage. `est:fallback` means the estimate used fallback `gpt-5.5` pricing because the session model was unknown or unsupported. |
+| **Estimate labels** | Running and recent job costs show `est` when derived from token usage, or `est:fallback` when the session model was unknown or unsupported and fallback `gpt-5.5` pricing was used. The aggregate spend panel only appends `est` when fallback-priced usage is present. |
 
 ### Controls & Alerts
 
@@ -163,12 +163,12 @@ A ready-made **`/codex` skill** — an orchestration doctrine (Claude plans, Cod
 
 ## Configuration
 
-Copy `.env.example` to `.env` and edit values as needed. The main knobs are:
+Copy `.env.example` to `.env` and edit values as needed. `codex_monitor.py` loads `CODEX_MONITOR_*` keys from the clone's `.env` at startup, before its module-level settings are read. Values already exported in the shell take priority over `.env`.
 
 - `CODEX_INSTRUCTIONS_FILE`: optional instructions file for `codex-instructions`.
 - `CODEX_WIRE_OUTDIR`: output directory for dispatch summaries and logs.
 - `CODEX_MONITOR_SESS_DIR`: Codex session JSONL root override. Default: `~/.codex/sessions`.
-- `CODEX_MONITOR_*`: dashboard scan limits, stale thresholds, bind host/port, tracking file, retry command, and session root.
+- `CODEX_MONITOR_*`: dashboard scan limits, stale thresholds, bind host/port, tracking file, cost index file, retry command, and session root.
 
 Spend estimates use the fixed pricing table built into `codex_monitor.py`; token pricing is not configured through `.env`.
 
