@@ -8,6 +8,12 @@ for 0.x releases.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-06-26
+
+### Fixed
+
+- Hid the Wire feed donut ring entirely when the feed is empty so only the numeric count remains visible.
+
 ## [0.5.1] - 2026-06-26
 
 ### Changed
@@ -140,7 +146,8 @@ for 0.x releases.
 
 - Removed internal improvement notes from the public tree.
 
-[Unreleased]: https://github.com/part3917/codex-wire/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/part3917/codex-wire/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/part3917/codex-wire/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/part3917/codex-wire/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/part3917/codex-wire/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/part3917/codex-wire/compare/v0.3.0...v0.4.0

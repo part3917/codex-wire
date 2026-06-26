@@ -56,7 +56,7 @@ def _load_monitor_env():
 _load_monitor_env()
 
 PORT = 8787
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.5.2"
 SESS = os.path.expanduser(os.environ.get("CODEX_MONITOR_SESS_DIR", "~/.codex/sessions"))
 HOME = os.path.expanduser("~")
 
@@ -2812,6 +2812,8 @@ document.addEventListener('mouseout',e=>{const bar=e.target.closest&&e.target.cl
 function renderFeedGauge(feed){
   const n=Array.isArray(feed)?feed.length:0, pct=Math.min(100,Math.max(0,n/FEED_CAP*100));
   const ring=document.getElementById('s_feed_ring');
+  const feedWrap=ring?ring.closest('.feed-ring'):null;
+  if(feedWrap)feedWrap.style.display=n>0?'':'none';
   if(ring){
     ring.style.strokeDashoffset=(100-pct).toFixed(2);
     ring.classList.remove('rate-ok','rate-warn','rate-bad');
