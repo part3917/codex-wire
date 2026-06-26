@@ -8,6 +8,10 @@ for 0.x releases.
 
 ## [Unreleased]
 
+### Note
+
+- Windows port (fork of v0.6.0): added Windows README usage notes and PowerShell install, run, and dispatch entrypoints while keeping the dashboard functionality and UI aligned with the upstream macOS project.
+
 ## [0.6.0] - 2026-06-26
 
 ### Performance

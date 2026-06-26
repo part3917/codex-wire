@@ -2,7 +2,9 @@
 
 # codex-wire
 
-OpenAI Codex CLI를 위한 실시간 텔레메트리 + 디스패치 래퍼로, Claude Code로 구동됩니다. by 3917
+[![Windows port of codex-wire](https://img.shields.io/badge/Windows%20port-of%20codex--wire-0078D4?logo=windows&logoColor=white)](https://github.com/part3917/codex-wire)
+
+codex-wire의 Windows 포트입니다. 원본 [part3917/codex-wire](https://github.com/part3917/codex-wire)를 기준으로 하며, 대시보드 기능과 UI는 macOS 원본과 동일하게 유지하고 Windows용 PowerShell 실행/디스패치 스크립트를 제공합니다. by 3917
 
 ![codex-wire 대시보드](assets/00-dashboard.png)
 
@@ -10,7 +12,7 @@ OpenAI Codex CLI를 위한 실시간 텔레메트리 + 디스패치 래퍼로, C
 
 ## 무엇을 하나요
 
-- `dispatch.sh`는 하나의 `codex exec` 작업을 실행하고, 고유한 `--output-last-message` 파일을 통해 완료를 감지한 뒤, Codex가 끝난 후에도 남아 있을 수 있는 잔여 프로세스를 정리합니다.
+- `dispatch.ps1`은 Windows에서 하나의 `codex exec` 작업을 실행하고, 고유한 `--output-last-message` 파일을 통해 완료를 감지한 뒤, Codex가 끝난 후에도 남아 있을 수 있는 잔여 프로세스를 정리합니다. 원본 bash `dispatch.sh`는 macOS/Linux 참고용으로 유지합니다.
 - `codex_monitor.py`는 `http://localhost:8787`에서 동작하는 Python 표준 라이브러리만으로 구성된 웹 대시보드입니다. `ps`와 `~/.codex/sessions`를 읽어 실행 중인 작업, 최근 세션, 활동, 토큰, 비용, 디스패치 상태를 보여줍니다.
 - `codex-instructions`는 `CODEX_INSTRUCTIONS_FILE`을 통해 Codex가 지시 파일을 참조하도록 가리켜 주는 선택적 런처입니다.
 
@@ -94,14 +96,68 @@ OpenAI Codex CLI를 위한 실시간 텔레메트리 + 디스패치 래퍼로, C
 
 같은 뷰의 맨 아래에 있는 로그북입니다(위 그림에 표시됨): 최근에 끝난, 실행 중이 아닌 세션을 상태, 경과 시간, 소스 디렉터리, 프롬프트, command / edit 개수, 토큰, 예상 비용, rate 백분율과 함께 보여줍니다. 빈 상태: *No history.*
 
-## 사전 준비물
+## Windows 사용법
+
+이 저장소는 [part3917/codex-wire](https://github.com/part3917/codex-wire)의 Windows 포트입니다. 기능과 UI는 macOS 원본과 동일하며, Windows에서는 PowerShell 기반 설치, 실행, 디스패치 진입점을 사용합니다.
+
+### Windows 요구사항
+
+- Windows 10 또는 Windows 11.
+- PowerShell에서 `python`으로 실행 가능한 Python 3.x.
+- 설치되어 있고 `codex` 명령으로 실행 가능한 OpenAI Codex CLI.
+- `codex login` 완료.
+- PowerShell.
+
+### Windows 설치
+
+이 clone의 PowerShell에서 실행합니다:
+
+```powershell
+.\install.ps1
+```
+
+`install.ps1`은 필요한 경우 `.env.example`에서 `.env`를 만들고, Windows 디스패치 래퍼를 `~\.codex\dispatch.ps1`에 설치합니다.
+
+### Windows 실행
+
+모니터를 시작합니다:
+
+```powershell
+.\run.ps1
+```
+
+또는 Python 모니터를 직접 실행할 수 있습니다:
+
+```powershell
+python .\codex_monitor.py
+```
+
+그런 다음 `http://localhost:8787`을 엽니다.
+
+### Windows 디스패치
+
+Windows에서 위임된 Codex 작업은 `dispatch.ps1`을 사용합니다:
+
+```powershell
+.\dispatch.ps1 <read-only|workspace-write> <cwd> "<prompt>" [max_minutes]
+```
+
+예시:
+
+```powershell
+.\dispatch.ps1 workspace-write (Get-Location).Path "Run the tests and fix any failures" 30
+```
+
+bash용 `dispatch.sh`는 macOS/Linux 원본 동작 참고용으로 남겨 둡니다. Windows에서는 `dispatch.ps1`을 사용하세요.
+
+## macOS / Bash 참고용 사전 준비물
 
 - [Claude Code](https://claude.com/claude-code) — Codex에 작업을 위임하도록 의도된 드라이버 (`dispatch.sh`는 단독으로도 실행할 수 있습니다).
 - OpenAI Codex CLI 설치.
 - `codex login` 완료.
 - Python 3.7+ (`ThreadingHTTPServer`와 `subprocess.run(..., text=True)`를 사용합니다).
 
-## 설치
+## macOS / Bash 참고용 설치
 
 ```bash
 git clone https://github.com/part3917/codex-wire.git codex-wire
@@ -125,7 +181,7 @@ cp .env.example .env
 
 로컬 경로와 기본값에 맞게 `.env`를 편집하세요.
 
-## 사용법
+## macOS / Bash 참고용 사용법
 
 위임된 Codex 작업 하나를 실행:
 

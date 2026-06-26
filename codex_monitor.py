@@ -5,8 +5,31 @@ Sources (stdlib only, no deps):
   • `ps`                          → running codex exec jobs (pid, elapsed, cwd, sandbox)
   • ~/.codex/sessions/**/*.jsonl  → live activity: commands, file edits, agent messages, tokens
 """
-import argparse, ctypes, datetime, functools, glob, hashlib, json, math, os, queue, re, secrets, shlex, shutil, signal, struct, subprocess, sys, tempfile, threading, time, urllib.parse
+import argparse, ctypes, datetime, functools, glob, hashlib, json, math, os, queue, re, secrets, shlex, shutil, signal, socket, struct, subprocess, sys, tempfile, threading, time, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+_IS_WIN = (os.name == "nt")
+
+
+def _expand_path(value):
+    return os.path.abspath(os.path.normpath(
+        os.path.expandvars(os.path.expanduser(str(value or "")))
+    ))
+
+
+def _env_path(name, default):
+    raw = os.environ.get(name)
+    return _expand_path(raw if raw not in (None, "") else default)
+
+
+def _path_key(path):
+    if not path:
+        return ""
+    return os.path.normcase(_expand_path(path))
+
+
+def _same_path(a, b):
+    return bool(a and b and _path_key(a) == _path_key(b))
 
 
 def _parse_env_line(line):
@@ -29,12 +52,14 @@ def _parse_env_line(line):
 def _load_monitor_env():
     """Load CODEX_MONITOR_* defaults from install.sh's .env location."""
     here = os.path.dirname(os.path.abspath(__file__))
-    paths = [os.path.join(here, ".env"), os.path.expanduser("~/.codex/.env")]
+    codex_home = _env_path("CODEX_HOME", "~/.codex")
+    paths = [os.path.join(here, ".env"), os.path.join(codex_home, ".env")]
     seen = set()
     for path in paths:
-        if path in seen:
+        key_path = _path_key(path)
+        if key_path in seen:
             continue
-        seen.add(path)
+        seen.add(key_path)
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 for line in fh:
@@ -43,7 +68,7 @@ def _load_monitor_env():
                         if not item:
                             continue
                         key, value = item
-                        if key.startswith("CODEX_MONITOR_") and key not in os.environ:
+                        if (key == "CODEX_HOME" or key.startswith("CODEX_MONITOR_")) and key not in os.environ:
                             os.environ[key] = value
                     except Exception:
                         continue
@@ -57,8 +82,9 @@ _load_monitor_env()
 
 PORT = 8787
 APP_VERSION = "0.6.0"
-SESS = os.path.expanduser(os.environ.get("CODEX_MONITOR_SESS_DIR", "~/.codex/sessions"))
-HOME = os.path.expanduser("~")
+CODEX_HOME = _env_path("CODEX_HOME", "~/.codex")
+SESS = _env_path("CODEX_MONITOR_SESS_DIR", os.path.join(CODEX_HOME, "sessions"))
+HOME = _expand_path("~")
 
 def _env_int(name, default):
     raw = os.environ.get(name)
@@ -77,9 +103,19 @@ ACTIVE_STALE_SEC = _env_int("CODEX_MONITOR_STALE_SEC", 120)
 FEED_WINDOW_SEC = _env_int("CODEX_MONITOR_FEED_WINDOW_SEC", 1800)
 FEED_CAP = 80
 LONG_OP_GRACE_SEC = _env_int("CODEX_MONITOR_LONG_OP_GRACE_SEC", 180)
-TRACK_PATH = os.path.expanduser(os.environ.get("CODEX_MONITOR_TRACK_PATH", "~/.codex/codex_wire_jobs.json"))
+TRACK_PATH = _env_path("CODEX_MONITOR_TRACK_PATH", os.path.join(CODEX_HOME, "codex_wire_jobs.json"))
 TRACK_TTL_SEC = _env_int("CODEX_MONITOR_TRACK_TTL_SEC", 7 * 24 * 3600)
-CODEX_BIN = os.path.expanduser(os.environ.get("CODEX_MONITOR_CODEX_BIN", "~/.npm-global/bin/codex"))
+
+
+def _default_codex_bin():
+    if _IS_WIN:
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return os.path.join(appdata, "npm", "codex.cmd")
+    return "~/.npm-global/bin/codex"
+
+
+CODEX_BIN = _env_path("CODEX_MONITOR_CODEX_BIN", _default_codex_bin())
 RPC_RATE_REFRESH_SEC = _env_int("CODEX_MONITOR_RPC_RATE_REFRESH_SEC", 45)
 POST_BODY_LIMIT = 256 * 1024
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -119,9 +155,13 @@ _STAGE_VERIFY_RE = re.compile(r"\b(test|pytest|lint|build|check|py_compile|tsc|v
 _STAGE_READ_RE = re.compile(r"\b(rg|sed|cat|ls|find|git show|git status|nl|wc)\b")
 _OUTPUT_STATUS_RE = re.compile(r"(?m)^\s*STATUS=(ok|timeout|error)\s*$")
 _PAGE_HTML_BYTES = None
+_WIN_CMDLINES = {}
+_WIN_CMDLINES_LOCK = threading.Lock()
 
 
 def _fsync_parent(path):
+    if _IS_WIN:
+        return
     parent = os.path.dirname(path) or "."
     try:
         fd = os.open(parent, os.O_RDONLY)
@@ -159,7 +199,47 @@ def _atomic_json_replace(path, data, *, separators=None):
 
 
 def _short(p):
-    return (p or "").replace(HOME, "~")
+    p = str(p or "")
+    if not p:
+        return p
+    try:
+        home_key = _path_key(HOME)
+        p_key = _path_key(p)
+        if p_key == home_key:
+            return "~"
+        prefix = home_key + os.sep
+        if p_key.startswith(prefix):
+            rel = os.path.relpath(_expand_path(p), HOME)
+            return os.path.join("~", rel)
+    except Exception:
+        pass
+    return p
+
+
+def _path_leaf(path, default="?"):
+    text = str(path or "")
+    if not text:
+        return default
+    text = _short(text)
+    leaf = os.path.basename(os.path.normpath(text))
+    return leaf or default
+
+
+def _retry_win_share(fn, attempts=5, delay=0.02):
+    for i in range(attempts):
+        try:
+            return fn()
+        except PermissionError as e:
+            if not _IS_WIN or i == attempts - 1:
+                raise
+            winerror = getattr(e, "winerror", None)
+            if winerror not in (32, 33):
+                raise
+            time.sleep(delay * (2 ** i))
+
+
+def _open_read_binary(path):
+    return _retry_win_share(lambda: open(path, "rb"))
 
 
 def _set_ps_state(**updates):
@@ -197,8 +277,81 @@ def _storage_degraded():
         }
 
 
+def _format_etime(seconds):
+    try:
+        seconds = max(0, int(seconds or 0))
+    except Exception:
+        seconds = 0
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if days:
+        return f"{days}-{hours:02d}:{minutes:02d}:{seconds:02d}"
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def _powershell_bin():
+    for name in ("powershell.exe", "powershell", "pwsh.exe", "pwsh"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+def _win_ps_lines():
+    ps = _powershell_bin()
+    if not ps:
+        raise RuntimeError("PowerShell not found")
+    script = r"""
+$now = Get-Date
+Get-CimInstance -ClassName Win32_Process |
+  Where-Object { $_.CommandLine -and $_.CommandLine -like '*codex*' -and $_.CommandLine -like '* exec*' } |
+  ForEach-Object {
+    $created = $_.CreationDate
+    $elapsed = 0
+    if ($null -ne $created) {
+      $elapsed = [int][Math]::Max(0, ($now - $created).TotalSeconds)
+    }
+    $cmd = [string]$_.CommandLine
+    $cmd = $cmd -replace "`r|`n", " "
+    [PSCustomObject]@{ pid = [int]$_.ProcessId; elapsed = $elapsed; cmd = $cmd }
+  } | ConvertTo-Json -Compress
+"""
+    proc = subprocess.run(
+        [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=6,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or "").strip() or f"PowerShell exited {proc.returncode}")
+    text = (proc.stdout or "").strip()
+    if not text:
+        rows = []
+    else:
+        data = json.loads(text)
+        rows = data if isinstance(data, list) else [data]
+    lines, cmdlines = [], {}
+    for row in rows:
+        try:
+            pid = int(row.get("pid"))
+        except Exception:
+            continue
+        cmd = str(row.get("cmd") or "").strip()
+        if not cmd:
+            continue
+        cmdlines[str(pid)] = cmd
+        lines.append(f"{pid} {_format_etime(row.get('elapsed'))} R {cmd}")
+    with _WIN_CMDLINES_LOCK:
+        _WIN_CMDLINES.clear()
+        _WIN_CMDLINES.update(cmdlines)
+    return lines
+
+
 def _ps_lines():
     try:
+        if _IS_WIN:
+            return _win_ps_lines()
         proc = subprocess.run(["ps", "-axww", "-o", "pid=,etime=,stat=,args="],
                               capture_output=True, text=True, timeout=4)
         if proc.returncode != 0:
@@ -216,12 +369,48 @@ def _is_monitor_server(pid, args):
         ipid = -1
     if ipid in (os.getpid(), os.getppid()):
         return True
+    argv = _argv_from_ps(args)
+    if argv:
+        for tok in argv[1:]:
+            if os.path.basename(str(tok).replace("\\", "/")).lower() == "codex_monitor.py":
+                exe = os.path.basename(str(argv[0]).replace("\\", "/")).lower()
+                if exe.startswith(("python", "pythonw", "py", "pyw")):
+                    return True
     return bool(_MONITOR_SERVER_RE.search(args))
 
 
 def _pid_alive(pid):
     try:
-        os.kill(int(pid), 0)
+        ipid = int(pid)
+    except Exception:
+        return False
+    if ipid <= 0:
+        return False
+    if _IS_WIN:
+        try:
+            from ctypes import wintypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            open_process = kernel32.OpenProcess
+            open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            open_process.restype = wintypes.HANDLE
+            wait = kernel32.WaitForSingleObject
+            wait.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+            wait.restype = wintypes.DWORD
+            close = kernel32.CloseHandle
+            close.argtypes = (wintypes.HANDLE,)
+            close.restype = wintypes.BOOL
+            handle = open_process(0x00100000, False, ipid)  # SYNCHRONIZE
+            if not handle:
+                return False
+            try:
+                result = wait(handle, 0)
+                return result == 0x00000102  # WAIT_TIMEOUT means still running.
+            finally:
+                close(handle)
+        except Exception:
+            return False
+    try:
+        os.kill(ipid, 0)
         return True
     except OSError:
         return False
@@ -265,8 +454,57 @@ def _libc():
     return _LIBC
 
 
+def _win_cmdline_to_argv(cmdline):
+    if not _IS_WIN or not cmdline:
+        return []
+    try:
+        from ctypes import wintypes
+        argc = ctypes.c_int(0)
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        shell32.CommandLineToArgvW.argtypes = (wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int))
+        shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+        kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+        kernel32.LocalFree.restype = ctypes.c_void_p
+        ptr = shell32.CommandLineToArgvW(str(cmdline), ctypes.byref(argc))
+        if not ptr:
+            return []
+        try:
+            return [ptr[i] for i in range(argc.value)]
+        finally:
+            kernel32.LocalFree(ctypes.cast(ptr, ctypes.c_void_p))
+    except Exception:
+        return []
+
+
+def _win_process_cmdline(pid):
+    with _WIN_CMDLINES_LOCK:
+        cmd = _WIN_CMDLINES.get(str(pid))
+    if cmd:
+        return cmd
+    ps = _powershell_bin()
+    if not ps:
+        return ""
+    try:
+        script = (
+            "$p = Get-CimInstance -ClassName Win32_Process -Filter \"ProcessId = "
+            + str(int(pid)) + "\"; if ($p -and $p.CommandLine) { [string]$p.CommandLine }"
+        )
+        proc = subprocess.run(
+            [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3,
+        )
+        if proc.returncode == 0:
+            return (proc.stdout or "").strip()
+    except Exception:
+        return ""
+    return ""
+
+
 def _proc_argv(pid):
-    """Return exact argv for a pid on macOS, preserving spaces inside args."""
+    """Return exact argv for a pid where the platform exposes a safe source."""
+    if _IS_WIN:
+        return _win_cmdline_to_argv(_win_process_cmdline(pid)) or None
     if sys.platform != "darwin":
         return None
     try:
@@ -311,6 +549,8 @@ def _proc_argv(pid):
 
 
 def _argv_from_ps(args):
+    if _IS_WIN:
+        return _win_cmdline_to_argv(args) or str(args or "").split()
     try:
         return shlex.split(args)
     except Exception:
@@ -347,10 +587,13 @@ def _raw_flag_value(args, *flags, want_dir=False):
         value = args[m.end():_next_flag_index(args[m.end():]) + m.end()].strip()
         if not value:
             continue
-        try:
-            parts = shlex.split(value)
-        except Exception:
-            parts = value.split()
+        if _IS_WIN:
+            parts = _win_cmdline_to_argv(value) or value.split()
+        else:
+            try:
+                parts = shlex.split(value)
+            except Exception:
+                parts = value.split()
         if not parts:
             continue
         if want_dir:
@@ -395,11 +638,25 @@ def _codex_exec_prompt(argv):
 def _normalize_out(path, cwd=None):
     if not path:
         return None
-    out = os.path.expanduser(str(path))
+    out = os.path.expandvars(os.path.expanduser(str(path)))
     if not os.path.isabs(out):
         base = cwd if cwd and os.path.isdir(cwd) else HOME
         out = os.path.join(base, out)
-    return os.path.abspath(out)
+    return _expand_path(out)
+
+
+def _looks_like_codex_exec(args, argv=None):
+    text = str(args or "")
+    if "codex" not in text.lower() or " exec" not in text:
+        return False
+    normalized = text.replace("\\", "/").lower()
+    if "/codex" in normalized or "@openai/codex" in normalized or "codex-upstream" in normalized:
+        return True
+    for tok in argv or []:
+        base = os.path.basename(str(tok).replace("\\", "/")).lower()
+        if base in ("codex", "codex.exe", "codex.cmd", "codex.bat", "codex.ps1"):
+            return True
+    return False
 
 
 def running_jobs(use_cache_on_failure=True):
@@ -420,11 +677,11 @@ def running_jobs(use_cache_on_failure=True):
             continue
         if "codex" not in args or " exec" not in args:
             continue
-        if "/codex" not in args and "@openai/codex" not in args and "codex-upstream" not in args:
-            continue
         if _is_monitor_server(pid, args):
             continue
         argv = _proc_argv(pid) or _argv_from_ps(args)
+        if not _looks_like_codex_exec(args, argv):
+            continue
         cwd = (_flag_value(argv, "-C", "--cd", "--cwd", "--directory") or
                _raw_flag_value(args, "-C", "--cd", "--cwd", "--directory", want_dir=True) or "?")
         out = (_flag_value(argv, "--output-last-message") or
@@ -491,7 +748,7 @@ def _iter(path, size=None, parse_errors=None):
     exact counters and pending command state without materializing all events."""
     # Active large sessions still pay a full scan on each change; correctness wins here.
     try:
-        with open(path, "rb") as fh:
+        with _open_read_binary(path) as fh:
             if size is None:
                 fh.seek(0, os.SEEK_END); size = fh.tell()
             fh.seek(0)
@@ -671,9 +928,58 @@ def _latest_active_rates(sessions, now):
 
 
 def _codex_rpc_bin():
-    if os.path.exists(CODEX_BIN) and os.access(CODEX_BIN, os.X_OK):
-        return CODEX_BIN
-    return shutil.which("codex")
+    def usable(path):
+        return bool(path and os.path.isfile(path) and (os.access(path, os.X_OK) or _IS_WIN))
+
+    candidates = [CODEX_BIN]
+    if _IS_WIN:
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            npm = os.path.join(appdata, "npm")
+            candidates.extend(os.path.join(npm, name) for name in
+                              ("codex.cmd", "codex.exe", "codex.bat", "codex.ps1"))
+        for name in ("codex.exe", "codex.cmd", "codex.bat", "codex"):
+            found = shutil.which(name)
+            if found:
+                candidates.append(found)
+        try:
+            proc = subprocess.run(["where.exe", "codex"], capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=3)
+            if proc.returncode == 0:
+                candidates.extend(line.strip() for line in proc.stdout.splitlines() if line.strip())
+        except Exception:
+            pass
+    else:
+        candidates.append(shutil.which("codex"))
+    seen = set()
+    for path in candidates:
+        if not path:
+            continue
+        key = _path_key(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if usable(path):
+            return path
+    return None
+
+
+def _win_creationflags():
+    return getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if _IS_WIN else 0
+
+
+def _terminate_process_tree(pid):
+    if _IS_WIN:
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(int(pid))],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            return
+        except Exception:
+            pass
+    try:
+        os.kill(int(pid), signal.SIGTERM)
+    except Exception:
+        pass
 
 
 def _rpc_window_rate(rate_limits, window_mins):
@@ -698,7 +1004,8 @@ def fetch_rate_via_rpc(timeout=10):
     proc = None
     try:
         proc = subprocess.Popen([codex_bin, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                                stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+                                errors="replace", bufsize=1, creationflags=_win_creationflags())
         requests = [
             {"jsonrpc": "2.0", "id": 1, "method": "initialize",
              "params": {"clientInfo": {"name": "codex-wire", "version": APP_VERSION}}},
@@ -773,11 +1080,15 @@ def fetch_rate_via_rpc(timeout=10):
                 pass
             try:
                 if proc.poll() is None:
-                    proc.kill()
+                    _terminate_process_tree(proc.pid)
+                    if proc.poll() is None:
+                        proc.kill()
                 proc.wait(timeout=2)
             except Exception:
                 try:
-                    proc.kill()
+                    _terminate_process_tree(proc.pid)
+                    if proc.poll() is None:
+                        proc.kill()
                     proc.wait(timeout=2)
                 except Exception:
                     pass
@@ -1185,7 +1496,7 @@ def _output_status(out):
     if not path:
         return None
     try:
-        with open(path, "rb") as fh:
+        with _open_read_binary(path) as fh:
             fh.seek(0, os.SEEK_END)
             size = fh.tell()
             fh.seek(max(0, size - 65536))
@@ -1353,7 +1664,7 @@ def _job_payload(j, s, now):
 # ── Cost history ─────────────────────────────────────────────────────────────
 # Cost graph points are derived from token_count cumulative deltas. This parser
 # intentionally does not use _iter(): large files must not skip middle deltas.
-_COST_INDEX_PATH = os.path.expanduser(os.environ.get("CODEX_MONITOR_COST_INDEX_PATH", "~/.codex/codex_wire_cost_index.json"))
+_COST_INDEX_PATH = _env_path("CODEX_MONITOR_COST_INDEX_PATH", os.path.join(CODEX_HOME, "codex_wire_cost_index.json"))
 _COST_INDEX_SCHEMA = 1
 _COST_INDEX = None
 _COST_INDEX_LOCK = threading.Lock()
@@ -1512,13 +1823,13 @@ def _save_cost_index(index):
 
 
 def _file_sig(path, st):
-    return (path, int(st.st_dev), int(st.st_ino), int(st.st_size), float(st.st_mtime))
+    return (_path_key(path), int(st.st_dev), int(st.st_ino), int(st.st_size), float(st.st_mtime))
 
 
 def _head_sig(path, limit=_COST_HEAD_SIG_BYTES):
     h = hashlib.sha256()
     try:
-        with open(path, "rb") as fh:
+        with _open_read_binary(path) as fh:
             h.update(fh.read(limit))
         return h.hexdigest()[:16]
     except Exception:
@@ -1574,7 +1885,7 @@ def _cost_file_record(path, st, old=None, reset=False):
 
     parse_errors, severe, parsed_any = [], False, False
     try:
-        with open(path, "rb") as fh:
+        with _open_read_binary(path) as fh:
             fh.seek(offset)
             while True:
                 pos = fh.tell()
@@ -2013,7 +2324,7 @@ def snapshot():
     # prompt matches this dispatch (so parallel agents in the same dir map to the RIGHT one)
     used = set()
     for j in jobs:
-        cand = [s for s in sessions if s["cwd"] == j["cwd_raw"]]
+        cand = [s for s in sessions if _same_path(s.get("cwd"), j.get("cwd_raw"))]
         match = None
         pl = (j.get("plabel") or "")[:60].lower()
         if pl:
@@ -2035,7 +2346,7 @@ def snapshot():
     for s in sessions:
         age = now - s["last_ts"]
         if age < FEED_WINDOW_SEC:
-            tag = _short(s["cwd"]).split("/")[-1] or "?"
+            tag = _path_leaf(s["cwd"], "?")
             for e in s["events"]:
                 feed.append({**e, "src": tag})
     feed.sort(key=lambda e: e.get("ts") or "", reverse=True)
@@ -2054,7 +2365,7 @@ def snapshot():
             "key": _session_key(s), "status": status, "status_label": activity.get("status_label") or status,
             "termination": activity.get("termination"), "stage": _stage(s, age_sec),
             "age_min": round((age_sec or 0) / 60, 1), "last_age_sec": age_sec,
-            "cwd": _short(s["cwd"]).split("/")[-1] or "session", "cwd_raw": s["cwd"],
+            "cwd": _path_leaf(s["cwd"], "session"), "cwd_raw": s["cwd"],
             "prompt": (s["prompt"] or s["last_msg"] or "(session)")[:500],
             "n_cmds": s["n_cmds"], "n_edits": s["n_edits"], "files": s["files"][:4],
             "rate_pct": s["rate_pct"], "tokens": _api_tokens(s["tokens"]), "token_total": s["tokens"].get("total", 0),
@@ -2065,8 +2376,9 @@ def snapshot():
 
     today = time.strftime("%Y/%m/%d")
     today_date = f"{today[5:7]}/{today[8:10]} ({('Mon','Tue','Wed','Thu','Fri','Sat','Sun')[time.localtime().tm_wday]})"
-    today_dir = os.path.join(SESS, today)
-    today_files = [f for f in session_files if os.path.dirname(f) == today_dir]
+    today_dir = os.path.join(SESS, *today.split("/"))
+    today_dir_key = _path_key(today_dir)
+    today_files = [f for f in session_files if _path_key(os.path.dirname(f)) == today_dir_key]
     today_n = len(today_files)
     today_hours = _session_hour_buckets(today_files, session_stats)
     today_sessions = _parse_session_files(sorted(today_files, key=lambda f: _session_mtime(f, session_stats), reverse=True), session_stats)
@@ -2279,7 +2591,7 @@ def _snapshot_retry_source(payload):
         rows = list(((_LAST_SNAPSHOT or {}).get("running") or []))
     for row in rows:
         pid_match = bool(pid) and str(row.get("pid")) == str(pid)
-        out_match = bool(out) and _normalize_out(row.get("out")) == out
+        out_match = bool(out) and _same_path(_normalize_out(row.get("out")), out)
         if pid and out:
             if pid_match and out_match:
                 return row
@@ -2311,10 +2623,18 @@ def post_kill(payload):
     confirm = _find_running_job(pid=target_pid)
     if not confirm:
         return {"ok": False, "error": "target pid is no longer a codex exec job"}, 409
-    if requested_out and confirm.get("out") != requested_out:
+    if requested_out and not _same_path(confirm.get("out"), requested_out):
         return {"ok": False, "error": "target pid output path changed; refusing to kill"}, 409
     try:
-        os.kill(int(target_pid), signal.SIGTERM)
+        if _IS_WIN:
+            proc = subprocess.run(["taskkill", "/F", "/T", "/PID", str(int(target_pid))],
+                                  capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace", timeout=8)
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout or "").strip() or f"taskkill exited {proc.returncode}"
+                return {"ok": False, "error": err}, 500
+        else:
+            os.kill(int(target_pid), signal.SIGTERM)
         _mark_dashboard_kill(target_pid, job.get("out"), job)
         return {"ok": True, "method": "pid", "pid": target_pid, "out": job.get("out")}
     except Exception as e:
@@ -2334,15 +2654,30 @@ def post_retry(payload):
         return {"ok": False, "error": "sandbox must be read-only or workspace-write"}, 400
     # CODEX_MONITOR_DISPATCH is an executable prefix that must accept codex CLI
     # args; the monitor appends: exec -C <cwd> -s <sandbox> <prompt>.
-    dispatch = shlex.split(os.environ.get("CODEX_MONITOR_DISPATCH", "codex"))
+    dispatch_raw = os.environ.get("CODEX_MONITOR_DISPATCH")
+    if dispatch_raw:
+        dispatch = (_win_cmdline_to_argv(dispatch_raw) if _IS_WIN else shlex.split(dispatch_raw))
+    else:
+        dispatch = [_codex_rpc_bin() or "codex"]
+    if not dispatch:
+        dispatch = [_codex_rpc_bin() or "codex"]
     cmd = dispatch + ["exec", "-C", cwd]
     cmd += ["-s", sandbox]
     cmd += [prompt]
     try:
-        p = subprocess.Popen(cmd, cwd=cwd if os.path.isdir(cwd) else HOME,
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
-        return {"ok": True, "pid": p.pid, "cmd": " ".join(shlex.quote(c) for c in cmd)}
+        popen_kwargs = {
+            "cwd": cwd if os.path.isdir(cwd) else HOME,
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if _IS_WIN:
+            popen_kwargs["creationflags"] = _win_creationflags()
+        else:
+            popen_kwargs["start_new_session"] = True
+        p = subprocess.Popen(cmd, **popen_kwargs)
+        cmd_display = subprocess.list2cmdline(cmd) if _IS_WIN else " ".join(shlex.quote(c) for c in cmd)
+        return {"ok": True, "pid": p.pid, "cmd": cmd_display}
     except Exception as e:
         return {"ok": False, "error": str(e)}, 500
 
@@ -3811,6 +4146,18 @@ class H(BaseHTTPRequestHandler):
         self._send(code, body, "application/json; charset=utf-8")
 
 
+class CodexWireHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = not _IS_WIN
+
+    def server_bind(self):
+        if _IS_WIN and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except Exception:
+                pass
+        super().server_bind()
+
+
 def main():
     global _BIND_HOST
     ap = argparse.ArgumentParser()
@@ -3823,7 +4170,7 @@ def main():
     if args.host in ("0.0.0.0", "::", ""):
         print(f"CODEX WIRE local → http://localhost:{args.port}")
     start_rate_rpc_refresher()
-    ThreadingHTTPServer((args.host, args.port), H).serve_forever()
+    CodexWireHTTPServer((args.host, args.port), H).serve_forever()
 
 
 if __name__ == "__main__":

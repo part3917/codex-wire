@@ -1,8 +1,10 @@
 # codex-wire
 
+[![Windows port of codex-wire](https://img.shields.io/badge/Windows%20port-of%20codex--wire-0078D4?logo=windows&logoColor=white)](https://github.com/part3917/codex-wire)
+
 English · [한국어](README.ko.md)
 
-Live telemetry + dispatch wrapper for the OpenAI Codex CLI, driven by Claude Code. by 3917
+Windows port of codex-wire. This fork tracks the original [part3917/codex-wire](https://github.com/part3917/codex-wire) project and keeps the same dashboard features and UI, with PowerShell launch and dispatch scripts for Windows. by 3917
 
 ![codex-wire dashboard](assets/00-dashboard.png)
 
@@ -10,7 +12,7 @@ Live telemetry + dispatch wrapper for the OpenAI Codex CLI, driven by Claude Cod
 
 ## What It Does
 
-- `dispatch.sh` runs one `codex exec` job, detects completion through its unique `--output-last-message` file, then reaps the lingering process that can remain after Codex has finished.
+- `dispatch.ps1` runs one `codex exec` job on Windows, detects completion through its unique `--output-last-message` file, then reaps the lingering process that can remain after Codex has finished. The original bash `dispatch.sh` is retained as a macOS/Linux reference.
 - `codex_monitor.py` is a Python-stdlib-only web dashboard at `http://localhost:8787`. It reads `ps` plus `~/.codex/sessions` to show live jobs, recent sessions, activity, tokens, spend, and dispatch state.
 - `codex-instructions` is an optional launcher that points Codex at an instructions file via `CODEX_INSTRUCTIONS_FILE`.
 
@@ -94,14 +96,68 @@ A scrolling, real-time feed of session events across all jobs — commands, edit
 
 The logbook at the bottom of the same view (shown above): recently finished, non-running sessions with their status, age, source directory, prompt, command / edit counts, tokens, estimated cost, and rate percent. Empty state: *No history.*
 
-## Prerequisites
+## Windows Usage
+
+This repository is the Windows port of [part3917/codex-wire](https://github.com/part3917/codex-wire). Functionality and UI are intended to match the macOS original; the Windows-specific pieces are the PowerShell install, run, and dispatch entrypoints.
+
+### Windows Requirements
+
+- Windows 10 or Windows 11.
+- Python 3.x available as `python` in PowerShell.
+- OpenAI Codex CLI installed and available as `codex`.
+- `codex login` completed.
+- PowerShell.
+
+### Windows Install
+
+From PowerShell in this clone:
+
+```powershell
+.\install.ps1
+```
+
+`install.ps1` creates `.env` from `.env.example` when needed and installs the Windows dispatch wrapper at `~\.codex\dispatch.ps1`.
+
+### Windows Run
+
+Start the monitor:
+
+```powershell
+.\run.ps1
+```
+
+Or run the Python monitor directly:
+
+```powershell
+python .\codex_monitor.py
+```
+
+Then open `http://localhost:8787`.
+
+### Windows Dispatch
+
+Use `dispatch.ps1` for delegated Codex jobs on Windows:
+
+```powershell
+.\dispatch.ps1 <read-only|workspace-write> <cwd> "<prompt>" [max_minutes]
+```
+
+Example:
+
+```powershell
+.\dispatch.ps1 workspace-write (Get-Location).Path "Run the tests and fix any failures" 30
+```
+
+The bash `dispatch.sh` is kept as a reference to the macOS/Linux upstream behavior. On Windows, use `dispatch.ps1`.
+
+## macOS / Bash Reference Prerequisites
 
 - [Claude Code](https://claude.com/claude-code) — the intended driver that delegates jobs to Codex (`dispatch.sh` can also be run on its own).
 - OpenAI Codex CLI installed.
 - `codex login` completed.
 - Python 3.7+ (`ThreadingHTTPServer` and `subprocess.run(..., text=True)` are used).
 
-## Install
+## macOS / Bash Reference Install
 
 ```bash
 git clone https://github.com/part3917/codex-wire.git codex-wire
@@ -125,7 +181,7 @@ cp .env.example .env
 
 Edit `.env` for your local paths and defaults.
 
-## Usage
+## macOS / Bash Reference Usage
 
 Run one delegated Codex job:
 
