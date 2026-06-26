@@ -8,6 +8,16 @@ for 0.x releases.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-26
+
+### Performance
+
+- Behavior-preserving optimizations (UI and `/api` output unchanged, verified via golden `/api` and incremental-parse self-tests):
+  - Frontend: skip re-rendering the Stage donut, rate lines, and control selects when their values are unchanged; same-value write guards; build the stage tooltip skeleton once.
+  - Backend snapshot: index running jobs by cwd (O(J·S)→O(S)); count `stage_counts`/`status_counts` in a single pass; lazy lowercasing in `_stage()`; precompiled JSONL regexes; reuse already-parsed session summaries for today's totals; combined output status/message file probe.
+  - Rate RPC: `SimpleQueue` for the reader, removed redundant cache copies, reader-thread join hardening.
+  - Incremental parser: reuse the head signature to avoid a redundant re-read.
+
 ## [0.9.1] - 2026-06-26
 
 ### Changed

@@ -56,7 +56,7 @@ def _load_monitor_env():
 _load_monitor_env()
 
 PORT = 8787
-APP_VERSION = "0.9.1"
+APP_VERSION = "0.10.0"
 SESS = os.path.expanduser(os.environ.get("CODEX_MONITOR_SESS_DIR", "~/.codex/sessions"))
 HOME = os.path.expanduser("~")
 
@@ -121,6 +121,8 @@ _EXIT_CODE_RE = re.compile(r"Process exited with code\s+(-?\d+)")
 _STAGE_VERIFY_RE = re.compile(r"\b(test|pytest|lint|build|check|py_compile|tsc|vitest)\b")
 _STAGE_READ_RE = re.compile(r"\b(rg|sed|cat|ls|find|git show|git status|nl|wc)\b")
 _OUTPUT_STATUS_RE = re.compile(r"(?m)^\s*STATUS=(ok|timeout|error)\s*$")
+_WS_RE = re.compile(r"\s+")
+_PATCH_FILE_RE = re.compile(r"[AM]\s+(\S+)")
 _PAGE_HTML_BYTES = None
 
 
@@ -333,12 +335,12 @@ def _flag_value(argv, *flags):
 
 
 def _next_flag_index(text):
-    matches = []
+    best = len(text)
     for rx in _NEXT_FLAG_RES:
         m = rx.search(text)
-        if m:
-            matches.append(m.start())
-    return min(matches) if matches else len(text)
+        if m and m.start() < best:
+            best = m.start()
+    return best
 
 
 def _raw_flag_value(args, *flags, want_dir=False):
@@ -468,12 +470,15 @@ def _add_parse_error(parse_errors, msg):
 
 
 def _jsonl_obj(raw, parse_errors=None, complete=None):
-    if not raw or not raw.strip():
+    if not raw:
+        return None
+    stripped = raw.strip()
+    if not stripped:
         return None
     if complete is None:
         complete = raw.endswith(b"\n")
     try:
-        obj = json.loads(raw.strip())
+        obj = json.loads(stripped)
     except Exception as e:
         if not complete:
             return None
@@ -517,7 +522,7 @@ def _epoch(ts):
 
 
 def _event(events, ts, k, t, important=False):
-    t = re.sub(r"\s+", " ", str(t or "")).strip()
+    t = _WS_RE.sub(" ", str(t or "")).strip()
     if t:
         events.append({"ts": ts, "k": k, "t": t[:300], "important": important})
         if len(events) > _EVENT_TAIL_MAX:
@@ -700,6 +705,7 @@ class _RateRpcClient:
         self.version = version
         self.proc = None
         self.lines = None
+        self.reader_thread = None
         self.next_id = 1
         self.lock = threading.Lock()
 
@@ -740,12 +746,13 @@ class _RateRpcClient:
         if self.is_alive():
             return
         self._close_locked()
-        self.lines = queue.Queue()
+        self.lines = queue.SimpleQueue()
         self.proc = subprocess.Popen([self.codex_bin, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1,
                                      start_new_session=True)
-        threading.Thread(target=self._reader, args=(self.proc, self.lines),
-                         name="codex-rate-rpc-reader", daemon=True).start()
+        self.reader_thread = threading.Thread(target=self._reader, args=(self.proc, self.lines),
+                                              name="codex-rate-rpc-reader", daemon=True)
+        self.reader_thread.start()
         init_id = self._send_locked("initialize", {"clientInfo": {"name": "codex-wire", "version": self.version}})
         self._read_responses_locked({init_id}, timeout)
 
@@ -799,8 +806,10 @@ class _RateRpcClient:
 
     def _close_locked(self):
         proc = self.proc
+        reader_thread = self.reader_thread
         self.proc = None
         self.lines = None
+        self.reader_thread = None
         if proc is not None:
             try:
                 if proc.stdin:
@@ -824,6 +833,11 @@ class _RateRpcClient:
             try:
                 if proc.stdout:
                     proc.stdout.close()
+            except Exception:
+                pass
+        if reader_thread is not None and reader_thread is not threading.current_thread():
+            try:
+                reader_thread.join(timeout=0.15)
             except Exception:
                 pass
 
@@ -876,12 +890,12 @@ def _set_rpc_rate_cache(data):
         return None
     with _RPC_RATE_CACHE_LOCK:
         _RPC_RATE_CACHE = dict(data)
-        return dict(_RPC_RATE_CACHE)
+        return _RPC_RATE_CACHE
 
 
 def _get_rpc_rate_cache():
     with _RPC_RATE_CACHE_LOCK:
-        return dict(_RPC_RATE_CACHE) if _RPC_RATE_CACHE else None
+        return _RPC_RATE_CACHE
 
 
 def _active_rpc_rate(now):
@@ -988,7 +1002,7 @@ def _apply_session_record(state, o):
                 cmd = args.get("cmd", "")
             except Exception:
                 cmd = p.get("arguments", "")
-            cmd = re.sub(r"\s+", " ", str(cmd)).strip()
+            cmd = _WS_RE.sub(" ", str(cmd)).strip()
             if cmd:
                 s["n_cmds"] += 1; s["last_cmd"] = cmd
                 if p.get("call_id"):
@@ -1016,7 +1030,7 @@ def _apply_session_record(state, o):
             _event(s["events"], ts, "edit", "apply_patch", True)
         elif ptype == "custom_tool_call_output":
             output = str(p.get("output", ""))
-            for m in re.finditer(r"[AM]\s+(\S+)", output):
+            for m in _PATCH_FILE_RE.finditer(output):
                 files.add(os.path.basename(m.group(1)))
             if "error" in output.lower() or "failed" in output.lower():
                 err = _error_entry(ts, "apply_patch", None, output)
@@ -1109,15 +1123,17 @@ def parse_session(path, st=None):
     return state["summary"] if state else None
 
 
-def _parse_cache_entry(path, st, state):
+def _parse_cache_entry(path, st, state, head_sig=None):
     ident = _stat_identity(st)
     head_sig_len = min(int(st.st_size), _PARSE_HEAD_SIG_BYTES)
+    if head_sig is None and ident:
+        head_sig = _head_signature(path, head_sig_len)
     return {
         "mtime": st.st_mtime,
         "size": st.st_size,
         "dev": ident[0] if ident else None,
         "ino": ident[1] if ident else None,
-        "head_sig": _head_signature(path, head_sig_len) if ident else None,
+        "head_sig": head_sig if ident else None,
         "head_sig_len": head_sig_len,
         "safe_offset": state.get("safe_offset", 0),
         "summary": state["summary"],
@@ -1151,7 +1167,8 @@ def _incremental_parse_cache_entry(path, st, ent):
     head_sig_len = ent.get("head_sig_len")
     if not isinstance(head_sig_len, int) or not ent.get("head_sig"):
         return None
-    if _head_signature(path, head_sig_len) != ent.get("head_sig"):
+    cur_head_sig = _head_signature(path, head_sig_len)
+    if cur_head_sig != ent.get("head_sig"):
         return None
     cached_state = ent.get("state")
     if not isinstance(cached_state, dict) or cached_state.get("parse_errors"):
@@ -1165,7 +1182,9 @@ def _incremental_parse_cache_entry(path, st, ent):
     _finalize_parse_state(state)
     if state.get("safe_offset") != st.st_size:
         return None
-    return _parse_cache_entry(path, st, state)
+    new_head_sig_len = min(int(st.st_size), _PARSE_HEAD_SIG_BYTES)
+    reusable_head_sig = cur_head_sig if head_sig_len == new_head_sig_len else None
+    return _parse_cache_entry(path, st, state, reusable_head_sig)
 
 
 def _mtime(path):
@@ -1243,12 +1262,13 @@ def _stage(s, age_sec):
     if age_sec is not None and age_sec > ACTIVE_STALE_SEC and not s.get("pending_long"):
         return "idle"
     for e in reversed(s.get("events", [])):
-        k, t = e.get("k"), (e.get("t") or "").lower()
+        k = e.get("k")
         if k == "edit":
             return "editing"
         if k == "err":
             return "verifying"
         if k == "cmd":
+            t = (e.get("t") or "").lower()
             if _STAGE_VERIFY_RE.search(t):
                 return "verifying"
             if _STAGE_READ_RE.search(t):
@@ -1387,20 +1407,10 @@ def _track_key(out):
     return _normalize_out(out) or ""
 
 
-def _output_has_message(out):
+def _output_status_and_has_message(out):
     path = _normalize_out(out)
     if not path:
-        return False
-    try:
-        return os.path.exists(path) and os.path.getsize(path) > 0
-    except Exception:
-        return False
-
-
-def _output_status(out):
-    path = _normalize_out(out)
-    if not path:
-        return None
+        return None, False
     try:
         with open(path, "rb") as fh:
             fh.seek(0, os.SEEK_END)
@@ -1408,9 +1418,20 @@ def _output_status(out):
             fh.seek(max(0, size - 65536))
             data = fh.read().decode("utf-8", "replace")
     except Exception:
-        return None
+        try:
+            return None, os.path.exists(path) and os.path.getsize(path) > 0
+        except Exception:
+            return None, False
     matches = _OUTPUT_STATUS_RE.findall(data)
-    return matches[-1] if matches else None
+    return (matches[-1] if matches else None), size > 0
+
+
+def _output_has_message(out):
+    return _output_status_and_has_message(out)[1]
+
+
+def _output_status(out):
+    return _output_status_and_has_message(out)[0]
 
 
 def _remember_jobs(jobs, now, state=None):
@@ -1478,7 +1499,7 @@ def _tracked_termination(rec):
     if rec.get("killed_by_dashboard"):
         return {"status": "killed", "status_label": "killed (dashboard)",
                 "reason": "terminated by dashboard /api/kill", "out": rec.get("out"), "dashboard": True}
-    dispatch_status = _output_status(rec.get("out"))
+    dispatch_status, has_message = _output_status_and_has_message(rec.get("out"))
     if dispatch_status in ("timeout", "error"):
         return {"status": "error", "status_label": dispatch_status,
                 "reason": f"dispatch STATUS={dispatch_status}", "out": rec.get("out"),
@@ -1487,7 +1508,7 @@ def _tracked_termination(rec):
         return {"status": "done", "status_label": "completed",
                 "reason": "dispatch STATUS=ok", "out": rec.get("out"),
                 "dashboard": False, "dispatch_status": dispatch_status}
-    if _output_has_message(rec.get("out")):
+    if has_message:
         return {"status": "done", "status_label": "completed",
                 "reason": "output-last-message exists and is non-empty", "out": rec.get("out"), "dashboard": False}
     return {"status": "interrupted", "status_label": "killed/interrupted",
@@ -2228,9 +2249,12 @@ def snapshot():
     sessions = all_sessions(SESSION_LIMIT, session_files, session_stats)
     # enrich running jobs with their live session: match each job to the session whose
     # prompt matches this dispatch (so parallel agents in the same dir map to the RIGHT one)
+    sessions_by_cwd = {}
+    for s in sessions:
+        sessions_by_cwd.setdefault(s["cwd"], []).append(s)
     used = set()
     for j in jobs:
-        cand = [s for s in sessions if s["cwd"] == j["cwd_raw"]]
+        cand = sessions_by_cwd.get(j["cwd_raw"], [])
         match = None
         pl = (j.get("plabel") or "")[:60].lower()
         if pl:
@@ -2246,7 +2270,19 @@ def snapshot():
             used.add(id(match))
         j["session"] = match
     _remember_jobs(jobs, now)
-    running = [_job_payload(j, j.get("session"), now) for j in jobs]
+    running = []
+    # Counts only live rows derived from the current ps codex process list.
+    status_counts = {k: 0 for k in ("running", "zombie", "error", "done", "killed", "interrupted")}
+    stage_counts = {k: 0 for k in STAGE_ORDER}
+    for j in jobs:
+        payload = _job_payload(j, j.get("session"), now)
+        running.append(payload)
+        status = payload["status"]
+        if status in status_counts:
+            status_counts[status] += 1
+        stage = payload.get("stage")
+        if stage in stage_counts:
+            stage_counts[stage] += 1
 
     feed = []
     for s in sessions:
@@ -2286,7 +2322,13 @@ def snapshot():
     today_files = [f for f in session_files if os.path.dirname(f) == today_dir]
     today_n = len(today_files)
     today_hours = _session_hour_buckets(today_files, session_stats)
-    today_sessions = _parse_session_files(sorted(today_files, key=lambda f: _session_mtime(f, session_stats), reverse=True), session_stats)
+    today_sorted = sorted(today_files, key=lambda f: _session_mtime(f, session_stats), reverse=True)
+    sessions_by_file = {s.get("file"): s for s in sessions}
+    missing_today_files = [f for f in today_sorted if f not in sessions_by_file]
+    missing_today_sessions = _parse_session_files(missing_today_files, session_stats)
+    missing_today_by_file = {s.get("file"): s for s in missing_today_sessions}
+    today_sessions = [sessions_by_file.get(f) or missing_today_by_file.get(f) for f in today_sorted]
+    today_sessions = [s for s in today_sessions if s is not None]
     rpc_rate = _active_rpc_rate(now)
     if rpc_rate:
         rate = float(rpc_rate["primary_pct"])
@@ -2321,16 +2363,6 @@ def snapshot():
         cost_total_raw += tokens.get("cost", 0.0)
         cost_estimate = cost_estimate or bool(tokens.get("cost_estimate"))
     cost_total = round(cost_total_raw, 4)
-    # Counts only live rows derived from the current ps codex process list.
-    status_counts = {k: 0 for k in ("running", "zombie", "error", "done", "killed", "interrupted")}
-    stage_counts = {k: 0 for k in STAGE_ORDER}
-    for j in running:
-        status = j["status"]
-        if status in status_counts:
-            status_counts[status] += 1
-        stage = j.get("stage")
-        if stage in stage_counts:
-            stage_counts[stage] += 1
     series = cost_series(now, session_files, session_stats)
     source_degraded = _ps_source_degraded()
     source_degraded.update(_storage_degraded())
@@ -3064,6 +3096,9 @@ function fmtRecentAge(m){m=Math.floor(Number(m)||0); const mm=String(m%60).padSt
 function fmtTok(n){n=Number(n||0); if(n>=1000000)return (n/1000000).toFixed(1)+'M'; if(n>=1000)return Math.round(n/100)/10+'k'; return String(n);}
 function setText(el,v){if(el&&el.textContent!==String(v??''))el.textContent=String(v??'');}
 function setHTML(el,v){if(el&&el.innerHTML!==v)el.innerHTML=v;}
+function setClass(el,v){if(el&&el.className!==v)el.className=v;}
+function setStyle(el,k,v){if(el&&el.style[k]!==String(v))el.style[k]=v;}
+function setAttr(el,k,v){if(el&&el.getAttribute(k)!==String(v))el.setAttribute(k,String(v));}
 function safeArray(v){return Array.isArray(v)?v:[];}
 function safeObject(v){return v&&typeof v==='object'&&!Array.isArray(v)?v:{};}
 function safeRender(name,fn,fallback){
@@ -3088,7 +3123,7 @@ function syncPressedButtons(root, attr, value){
   [...el.querySelectorAll('button')].forEach(b=>{
     const on=b.dataset[attr]===value;
     b.classList.toggle('on',on);
-    b.setAttribute('aria-pressed',on?'true':'false');
+    setAttr(b,'aria-pressed',on?'true':'false');
   });
 }
 function emptyHTML(text){return `<div class=empty>${esc(text)}</div>`;}
@@ -3157,8 +3192,8 @@ function renderLiveStat(d, counts){
   if(stack.dataset.sig===sig)return;
   stack.dataset.sig=sig;
   const label=count===1?'1 live agent':`${count} live agents`;
-  stack.setAttribute('aria-label',label);
-  const wrap=stack.closest('.agent-stack-wrap'); if(wrap){wrap.title=label;wrap.style.display=count>0?'':'none';}
+  setAttr(stack,'aria-label',label);
+  const wrap=stack.closest('.agent-stack-wrap'); if(wrap){wrap.title=label;setStyle(wrap,'display',count>0?'':'none');}
   const target=visible||1;
   const fresh=[];
   let plates=Array.from(stack.querySelectorAll('.agent-plate'));
@@ -3248,6 +3283,7 @@ function stageTip(){
   stageTipEl=document.createElement('div');
   stageTipEl.className='hour-tip stage-tip';
   stageTipEl.setAttribute('role','tooltip');
+  stageTipEl.innerHTML='<i></i><span></span>';
   document.body.appendChild(stageTipEl);
   return stageTipEl;
 }
@@ -3258,8 +3294,9 @@ function moveStageTip(e){
 }
 function showStageTip(seg,e){
   const tip=stageTip(), stage=seg.dataset.stage||'', count=seg.dataset.count||'0';
-  tip.innerHTML=`<i style="color:${seg.getAttribute('stroke')||'currentColor'}"></i><span></span>`;
-  tip.querySelector('span').textContent=`${stage}: ${count}`;
+  const dot=tip.firstElementChild, text=dot&&dot.nextElementSibling;
+  if(dot)dot.style.color=seg.getAttribute('stroke')||'currentColor';
+  if(text)text.textContent=`${stage}: ${count}`;
   moveStageTip(e);
   tip.classList.add('show');
 }
@@ -3299,45 +3336,52 @@ function ensureStageSegments(segs){
 function renderStageCard(counts){
   const data=(counts&&typeof counts==='object')?counts:{};
   const parts=STAGE_ORDER.map(stage=>({stage,n:Math.max(0,Number(data[stage])||0)}));
+  const stageSig=parts.map(p=>p.n).join('|');
   const total=parts.reduce((sum,p)=>sum+p.n,0);
   const wrap=document.getElementById('s_stage_ring');
   const segs=document.getElementById('s_stage_segments');
   const legend=document.getElementById('s_stage_legend');
+  const nodes=segs?ensureStageSegments(segs):null;
+  if(segs&&nodes&&segs.dataset.sig===stageSig)return;
   setText(document.getElementById('s_stage_total'),total);
   if(wrap){
-    wrap.style.display='';
+    setStyle(wrap,'display','');
     wrap.title=total>0?parts.filter(p=>p.n>0).map(p=>`${p.stage}: ${p.n}`).join(' / '):'0 running';
     const svg=wrap.querySelector('svg');
-    if(svg)svg.setAttribute('aria-label',total>0?`stage distribution, ${wrap.title}`:'stage distribution, 0 running');
+    if(svg)setAttr(svg,'aria-label',total>0?`stage distribution, ${wrap.title}`:'stage distribution, 0 running');
   }
   if(!segs)return;
-  const nodes=ensureStageSegments(segs);
   let offset=0;
   parts.forEach((p,i)=>{
     const pct=total>0?p.n/total*100:0, dash=`${pct.toFixed(4)} ${(100-pct).toFixed(4)}`;
     const seg=nodes[i];
     if(!seg)return;
-    seg.setAttribute('stroke',STAGE_COLORS[p.stage]);
-    seg.setAttribute('stroke-dasharray',dash);
-    seg.setAttribute('stroke-dashoffset',(-offset).toFixed(4));
+    setAttr(seg,'stroke',STAGE_COLORS[p.stage]);
+    setAttr(seg,'stroke-dasharray',dash);
+    setAttr(seg,'stroke-dashoffset',(-offset).toFixed(4));
     seg.dataset.stage=p.stage;
     seg.dataset.count=String(p.n);
-    seg.setAttribute('aria-label',`${p.stage}: ${p.n}`);
+    setAttr(seg,'aria-label',`${p.stage}: ${p.n}`);
     offset+=pct;
   });
   if(legend){
-    legend.innerHTML=parts.filter(p=>p.n>0).map(p=>`<span style="color:${STAGE_COLORS[p.stage]}"><i></i>${p.stage} ${p.n}</span>`).join('');
+    setHTML(legend,parts.filter(p=>p.n>0).map(p=>`<span style="color:${STAGE_COLORS[p.stage]}"><i></i>${p.stage} ${p.n}</span>`).join(''));
   }
+  segs.dataset.sig=stageSig;
 }
 function renderRateLine(value, valueId, barId){
   const n=Number(value), ok=Number.isFinite(n);
-  setHTML(document.getElementById(valueId),(ok?Math.round(n):'—')+'<small>%</small>');
+  const text=(ok?Math.round(n):'—')+'<small>%</small>';
+  setHTML(document.getElementById(valueId),text);
   const bar=document.getElementById(barId);
   if(!bar)return;
   const pct=ok?Math.min(100,Math.max(0,n)):0;
-  bar.style.width=pct+'%';
-  bar.classList.remove('rate-ok','rate-warn','rate-bad');
-  if(ok)bar.classList.add(pct>85?'rate-bad':(pct>=70?'rate-warn':'rate-ok'));
+  const cls=ok?(pct>85?'rate-bad':(pct>=70?'rate-warn':'rate-ok')):'';
+  const sig=text+'|'+pct+'|'+cls;
+  if(bar.dataset.sig===sig)return;
+  bar.dataset.sig=sig;
+  setStyle(bar,'width',pct+'%');
+  setClass(bar,cls);
 }
 function renderRateAccount(d){
   const el=document.getElementById('s_rate_account'); if(!el)return;
@@ -3346,14 +3390,14 @@ function renderRateAccount(d){
   if(!account&&!plan){
     setText(el,'');
     el.removeAttribute('title');
-    el.style.display='none';
+    setStyle(el,'display','none');
     return;
   }
   const user=account?account.split('@')[0]:plan;
   const text=plan&&account?`${user} · ${plan}`:user;
   setText(el,text);
   el.title=account?(plan?`${account} · ${plan}`:account):plan;
-  el.style.display='block';
+  setStyle(el,'display','block');
 }
 function renderRate(d){
   renderRateAccount(d);
@@ -3371,8 +3415,8 @@ function degradedBanner(d){
 }
 function setWireBanner(msg){
   const el=document.getElementById('wirebanner'); if(!el)return;
-  if(msg){setText(el,msg);el.style.display='block';}
-  else{setText(el,'');el.style.display='none';}
+  if(msg){setText(el,msg);setStyle(el,'display','block');}
+  else{setText(el,'');setStyle(el,'display','none');}
 }
 function renderBulletin(d){
   const c=(d&&d.status_counts)||{};
@@ -3566,8 +3610,11 @@ function parseElapsed(s){let p=String(s||'0').split(/[:-]/).map(Number);let sec=
 function updateSelect(id, values){
   const el=document.getElementById(id), old=controlValue(id);
   if(old&&!values.includes(old))values=[old,...values];
+  const sig=values.join('\0')+'|'+old;
+  if(el&&el.dataset.sig===sig)return;
   const html='<option value="">all</option>'+values.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join('');
   setHTML(el,html); el.value=values.includes(old)?old:''; controlState[id]=el.value;
+  if(el)el.dataset.sig=sig;
 }
 function renderControls(d){
   const running=safeArray(d&&d.running);
@@ -3988,9 +4035,9 @@ async function tick(manual=false){
   const counts=safeRender('renderBulletin',()=>renderBulletin(d),{zombie:0,error:0})||{zombie:0,error:0};
   setText(document.getElementById('ts'),d.ts); setText(document.getElementById('date'),d.date);
   setText(document.getElementById('meta_date'),d.date); setText(document.getElementById('meta_no'),d.today);
-  document.getElementById('lamp').className=counts.error>0?'lamp bad':('lamp'+(d.count>0?' on':''));
+  setClass(document.getElementById('lamp'),counts.error>0?'lamp bad':('lamp'+(d.count>0?' on':'')));
   setText(document.getElementById('onair'),d.count>0?'ON AIR':'STANDBY');
-  document.getElementById('onair').style.color=counts.error>0?'var(--bad)':(d.count>0?'var(--ember)':'var(--dim)');
+  setStyle(document.getElementById('onair'),'color',counts.error>0?'var(--bad)':(d.count>0?'var(--ember)':'var(--dim)'));
   setText(document.getElementById('s_run'),d.count); safeRender('renderLiveStat',()=>renderLiveStat(d,counts));
   setText(document.getElementById('s_today'),d.today); setText(document.getElementById('s_today_date'),d.today_date||'--/--'); safeRender('renderTodayHours',()=>renderTodayHours(d.today_hours));
   safeRender('renderRate',()=>renderRate(d));
@@ -4006,9 +4053,9 @@ async function tick(manual=false){
   if(runId!==tickRun)return;
   console.error('CODEX WIRE fetch failed:',e);
   document.body.classList.add('offline');setWireBanner(e.apiBanner||(timedOut?'LINE DOWN — request timed out':'LINE DOWN — connection lost'));
-  document.getElementById('lamp').className='lamp bad';
+  setClass(document.getElementById('lamp'),'lamp bad');
   setText(document.getElementById('ts'),'connection lost');setText(document.getElementById('onair'),'LINE DOWN');
-  document.getElementById('onair').style.color='var(--bad)';
+  setStyle(document.getElementById('onair'),'color','var(--bad)');
  }finally{
   clearTimeout(timeout);
   if(runId===tickRun){
