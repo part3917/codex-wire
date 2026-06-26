@@ -56,7 +56,7 @@ def _load_monitor_env():
 _load_monitor_env()
 
 PORT = 8787
-APP_VERSION = "0.5.2"
+APP_VERSION = "0.5.3"
 SESS = os.path.expanduser(os.environ.get("CODEX_MONITOR_SESS_DIR", "~/.codex/sessions"))
 HOME = os.path.expanduser("~")
 
@@ -1916,7 +1916,7 @@ def snapshot():
     recent = recent[:RECENT_LIMIT]
 
     today = time.strftime("%Y/%m/%d")
-    today_date = f"{today[5:7]}/{today[8:10]} ({('월','화','수','목','금','토','일')[time.localtime().tm_wday]})"
+    today_date = f"{today[5:7]}/{today[8:10]} ({('Mon','Tue','Wed','Thu','Fri','Sat','Sun')[time.localtime().tm_wday]})"
     try:
         today_files = glob.glob(os.path.join(SESS, today, "*.jsonl"))
     except Exception:
@@ -1988,7 +1988,7 @@ def _snapshot_shape(data):
     }
     data.setdefault("count", len(data["running"]))
     data.setdefault("today", 0)
-    data.setdefault("today_date", time.strftime("%m/%d") + f" ({('월','화','수','목','금','토','일')[time.localtime().tm_wday]})")
+    data.setdefault("today_date", time.strftime("%m/%d") + f" ({('Mon','Tue','Wed','Thu','Fri','Sat','Sun')[time.localtime().tm_wday]})")
     data.setdefault("rate", None)
     data.setdefault("rate7d", None)
     data.setdefault("rate_resets_at", None)
@@ -2573,7 +2573,7 @@ footer{margin-top:40px;color:var(--faint);font-size:10.5px;border-top:1px solid 
 
 <div class=strip>
   <div class="stat live-stat" title="running codex processes from ps"><div class=l>Live</div><div class=live-row><div class=v id=s_run>—</div><div class=agent-stack-wrap title="0 live agents"><div id=s_run_stack class=agent-stack role=img aria-label="0 live agents"></div></div></div></div>
-  <div class=stat title="오늘 생성된 codex 세션 파일 수"><div class=stat-head><div class=l>Sessions today</div><div class=stat-date id=s_today_date title="서버 로컬 날짜 기준">--/--</div></div><div class=v id=s_today>—</div><div class="stat-micro hour-bars" id=s_today_hours aria-label="sessions by hour"></div><div class=hour-scale aria-hidden=true><span class=h0>0</span><span class=h4>4</span><span class=h8>8</span><span class=h12>12</span><span class=h16>16</span><span class=h20>20</span></div></div>
+  <div class=stat title="codex session files created today"><div class=stat-head><div class=l>Sessions today</div><div class=stat-date id=s_today_date title="server local date">--/--</div></div><div class=v id=s_today>—</div><div class="stat-micro hour-bars" id=s_today_hours aria-label="sessions by hour"></div><div class=hour-scale aria-hidden=true><span class=h0>0</span><span class=h4>4</span><span class=h8>8</span><span class=h12>12</span><span class=h16>16</span><span class=h20>20</span></div></div>
   <div class=stat>
     <div class=rate-head><div class=rate-label><div class=l>Rate</div><div class=rate-account id=s_rate_account></div></div><div class=rate-resets id=s_rate_resets>↻ 5h -- · 7d --</div></div>
     <div class=rate-lines>
@@ -2714,7 +2714,7 @@ function formatRateReset(epoch, withDate=false){
   const n=Number(epoch); if(!Number.isFinite(n)||n<=0)return '--';
   const d=new Date(n*1000); if(Number.isNaN(d.getTime()))return '--';
   const hh=String(d.getHours()).padStart(2,'0'), mm=String(d.getMinutes()).padStart(2,'0');
-  return withDate?`${d.getMonth()+1}월 ${d.getDate()}일 ${hh}:${mm}`:`${hh}:${mm}`;
+  return withDate?`${d.getMonth()+1}/${d.getDate()} ${hh}:${mm}`:`${hh}:${mm}`;
 }
 const FEED_CAP=80;
 function renderLiveStat(d, counts){
@@ -2728,7 +2728,7 @@ function renderLiveStat(d, counts){
   const visible=Math.min(count,maxFit), overflow=Math.max(0,count-visible);
   const label=count===1?'1 live agent':`${count} live agents`;
   stack.setAttribute('aria-label',label);
-  const wrap=stack.closest('.agent-stack-wrap'); if(wrap)wrap.title=label;
+  const wrap=stack.closest('.agent-stack-wrap'); if(wrap){wrap.title=label;wrap.style.display=count>0?'':'none';}
   const target=visible||1;
   const fresh=[];
   let plates=Array.from(stack.querySelectorAll('.agent-plate'));
@@ -3069,7 +3069,7 @@ function promptBlock(j){
 function msgBlock(j){
   const k=stableId(j), open=msgOpen.has(k), id='msg_'+domIdPart(k);
   const msg=esc(j.last_msg||'');
-  return msg?`<div class="msgbox ${open?'open':''}" id="${id}" data-field=msg>“${msg}”</div><button class="toggle-more msgtoggle" data-act=msg type=button aria-controls="${id}" aria-expanded="${open?'true':'false'}" hidden>${open?'접기':'더보기'}</button>`:'';
+  return msg?`<div class="msgbox ${open?'open':''}" id="${id}" data-field=msg>“${msg}”</div><button class="toggle-more msgtoggle" data-act=msg type=button aria-controls="${id}" aria-expanded="${open?'true':'false'}" hidden>${open?'Collapse':'More'}</button>`:'';
 }
 function msgNeedsToggle(box){
   if(!box)return false;
@@ -3095,7 +3095,7 @@ function syncMsgClamp(el,k){
   box.classList.toggle('open',open);
   btn.hidden=!show;
   btn.setAttribute('aria-expanded',open?'true':'false');
-  btn.textContent=open?'접기':'더보기';
+  btn.textContent=open?'Collapse':'More';
 }
 function telem(j){
   return `<span class=m><b>${j.n_cmds||0}</b>cmds</span><span class=m><b>${j.n_edits||0}</b>edits</span><span class=m><b>${fmtTok(j.token_total)}</b>tok</span><span class=m><b>$${Number(j.cost||0).toFixed(3)}</b>${costNote(j)}</span>${j.rate_pct!=null?`<span class=m><b>${Math.round(j.rate_pct)}</b><small style=color:var(--dim)>% rate</small></span>`:''}`;
@@ -3186,7 +3186,7 @@ function renderCards(){
   let empty=R.querySelector('.empty'); if(list.length&&empty)empty.remove();
   if(!list.length){
     [...R.children].forEach(ch=>{if(ch.classList.contains('card'))ch.remove();});
-    const msg=(latest&&latest.running&&latest.running.length>0)?'NO MATCH — 필터에 맞는 작업 없음':'── NO DISPATCHES ON THE WIRE ──';
+    const msg=(latest&&latest.running&&latest.running.length>0)?'NO MATCH — no jobs match the filters':'── NO DISPATCHES ON THE WIRE ──';
     if(!empty){empty=document.createElement('div');empty.className='empty';R.appendChild(empty);}
     setText(empty,msg);
     return;
@@ -3447,7 +3447,7 @@ async function tick(manual=false){
  }catch(e){
   if(runId!==tickRun)return;
   console.error('CODEX WIRE fetch failed:',e);
-  document.body.classList.add('offline');setWireBanner(e.apiBanner||(timedOut?'LINE DOWN — request timed out':'LINE DOWN — 연결 끊김'));
+  document.body.classList.add('offline');setWireBanner(e.apiBanner||(timedOut?'LINE DOWN — request timed out':'LINE DOWN — connection lost'));
   document.getElementById('lamp').className='lamp bad';
   setText(document.getElementById('ts'),'connection lost');setText(document.getElementById('onair'),'LINE DOWN');
   document.getElementById('onair').style.color='var(--bad)';

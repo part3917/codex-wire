@@ -8,6 +8,16 @@ for 0.x releases.
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-06-26
+
+### Fixed
+
+- Hid the Live card agent stack when no agents are running so the idle plate remnant no longer appears beside the numeric count.
+
+### Changed
+
+- Standardized dashboard UI strings on English copy, including session-date tooltips, empty/offline states, expand/collapse labels, and server-local weekday abbreviations.
+
 ## [0.5.2] - 2026-06-26
 
 ### Fixed
@@ -146,7 +156,8 @@ for 0.x releases.
 
 - Removed internal improvement notes from the public tree.
 
-[Unreleased]: https://github.com/part3917/codex-wire/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/part3917/codex-wire/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/part3917/codex-wire/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/part3917/codex-wire/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/part3917/codex-wire/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/part3917/codex-wire/compare/v0.4.0...v0.5.0
