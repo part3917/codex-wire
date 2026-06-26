@@ -8,6 +8,12 @@ for 0.x releases.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-06-26
+
+### Changed
+
+- Stage distribution donut segments now animate smoothly (grow/shrink and shift) on value changes — segment nodes persist and update via `stroke-dasharray`/`stroke-dashoffset` with a CSS transition instead of being rebuilt each tick.
+
 ## [0.9.0] - 2026-06-26
 
 ### Added
