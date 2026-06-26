@@ -8,6 +8,13 @@ for 0.x releases.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-06-26
+
+### Changed
+
+- Reduced the Live stack plate tilt so running-agent plates sit more upright.
+- Made the Live stack visible plate count respond to available card width, keeping narrow layouts compact while showing more plates on wider cards.
+
 ## [0.5.0] - 2026-06-26
 
 ### Added
@@ -133,7 +140,8 @@ for 0.x releases.
 
 - Removed internal improvement notes from the public tree.
 
-[Unreleased]: https://github.com/part3917/codex-wire/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/part3917/codex-wire/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/part3917/codex-wire/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/part3917/codex-wire/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/part3917/codex-wire/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/part3917/codex-wire/compare/v0.2.0...v0.3.0

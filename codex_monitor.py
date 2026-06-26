@@ -56,7 +56,7 @@ def _load_monitor_env():
 _load_monitor_env()
 
 PORT = 8787
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.1"
 SESS = os.path.expanduser(os.environ.get("CODEX_MONITOR_SESS_DIR", "~/.codex/sessions"))
 HOME = os.path.expanduser("~")
 
@@ -2254,10 +2254,10 @@ body.offline{filter:saturate(.4)}
   border:1px solid rgba(255,255,255,.12);
   background:rgba(207,89,21,.34);
   box-shadow:0 2px 6px rgba(42,29,16,.06);
-  backdrop-filter:blur(7px) saturate(1.25);-webkit-backdrop-filter:blur(7px) saturate(1.25);transform:rotate(-15deg) translateY(5px) scale(.92);
+  backdrop-filter:blur(7px) saturate(1.25);-webkit-backdrop-filter:blur(7px) saturate(1.25);transform:rotate(-8deg) translateY(5px) scale(.92);
   transform-origin:center;opacity:0;transition:left .28s ease,opacity .28s ease,transform .28s ease,filter .28s ease}
 .agent-plate:after{content:none}
-.agent-plate.live{transform:rotate(-15deg) translateY(0) scale(1)}
+.agent-plate.live{transform:rotate(-8deg) translateY(0) scale(1)}
 .agent-plate.idle-plate{border-color:rgba(255,255,255,.10);background:rgba(207,89,21,.20);box-shadow:none;opacity:.5}
 .agent-plus{position:absolute;top:18px;left:0;color:var(--dim);font:700 10px/1 "JetBrains Mono",monospace;font-variant-numeric:tabular-nums;letter-spacing:0}
 .stat-micro{margin-top:8px}
@@ -2720,7 +2720,12 @@ const FEED_CAP=80;
 function renderLiveStat(d, counts){
   const stack=document.getElementById('s_run_stack'); if(!stack)return;
   const count=Math.max(0,Math.floor(Number(d&&d.count)||0));
-  const visible=Math.min(count,10), overflow=Math.max(0,count-visible);
+  const W=Math.max(58,stack.clientWidth||stack.getBoundingClientRect().width||146);
+  const plateW=26, stepIdeal=16, plusReserve=24, hardCeiling=20;
+  const fitFor=plusSpace=>Math.max(1,1+Math.floor((W-plateW-plusSpace)/stepIdeal));
+  const maxFit0=fitFor(0);
+  const maxFit=Math.min(hardCeiling,count>maxFit0?fitFor(plusReserve):maxFit0);
+  const visible=Math.min(count,maxFit), overflow=Math.max(0,count-visible);
   const label=count===1?'1 live agent':`${count} live agents`;
   stack.setAttribute('aria-label',label);
   const wrap=stack.closest('.agent-stack-wrap'); if(wrap)wrap.title=label;
@@ -2737,10 +2742,9 @@ function renderLiveStat(d, counts){
   }
   plates.forEach((p,i)=>{if(i>=target)p.remove();});
   plates=Array.from(stack.querySelectorAll('.agent-plate')).slice(0,target);
-  const W=Math.max(58,stack.clientWidth||stack.getBoundingClientRect().width||146);
-  const plateW=26, plusSpace=overflow>0?24:0;
-  const available=Math.max(0,W-plateW-plusSpace-2);
-  const step=visible>1?Math.min(16,available/(visible-1)):0;
+  const plusSpace=overflow>0?plusReserve:0;
+  const available=Math.max(0,W-plateW-plusSpace);
+  const step=visible>1?Math.min(stepIdeal,available/(visible-1)):0;
   plates.forEach((p,i)=>{
     const x=count>0?i*step:0;
     const opacity=count===0?'.38':String(Math.min(.96,.70+(i*.03)));
@@ -2750,7 +2754,7 @@ function renderLiveStat(d, counts){
     p.style.filter='none';
     if(fresh.includes(p)){
       p.style.opacity='0';
-      p.style.transform='rotate(-15deg) translateY(5px) scale(.92)';
+      p.style.transform='rotate(-8deg) translateY(5px) scale(.92)';
       requestAnimationFrame(()=>{p.style.opacity=opacity;p.style.transform='';});
     }else{
       p.style.opacity=opacity;
